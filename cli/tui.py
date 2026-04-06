@@ -18,6 +18,8 @@ from textual.widgets import (
     Select,
     Static,
     Switch,
+    TabbedContent,
+    TabPane,
 )
 
 from .checkpoints import list_hf_checkpoints
@@ -32,7 +34,7 @@ class BenchmarkTuiApp(App[None]):
       layout: vertical;
     }
 
-    #benchmark_main {
+    #benchmark_main, #slurm_main {
       height: 1fr;
     }
 
@@ -49,11 +51,28 @@ class BenchmarkTuiApp(App[None]):
       border: solid $secondary;
     }
 
+    #slurm_filters {
+      width: 42;
+      padding: 1;
+      border: solid $primary;
+      overflow-y: auto;
+    }
+
+    #slurm_status {
+      width: 1fr;
+      padding: 1;
+      border: solid $secondary;
+    }
+
     .spacer {
       height: 1;
     }
 
-    #gpu_table, #jobs_table {
+    #gpu_table {
+      height: 14;
+    }
+
+    #jobs_table {
       height: 10;
     }
 
@@ -84,54 +103,70 @@ class BenchmarkTuiApp(App[None]):
         group_options = [("(all)", "all")] + [(g, g) for g in coir_groups]
 
         yield Header(show_clock=True)
-        with Horizontal(id="benchmark_main"):
-            with Vertical(id="controls"):
-                yield Label("Benchmark")
-                yield Select(options=benchmark_options, value="repoeval", id="benchmark")
-                yield Label("COIR Group")
-                yield Select(options=group_options, value="all", id="dataset_group")
-                yield Label("Model Profile")
-                default_profile = model_options[0][1]
-                yield Select(options=model_options, value=default_profile, id="model_profile")
-                yield Label("Checkpoint Step (optional)")
-                yield Input(placeholder="e.g. 3000", id="checkpoint_step")
-                yield Label("Slurm GPUs")
-                yield Input(value=str(self.cfg["slurm"].get("gpus", 1)), id="slurm_gpus")
-                yield Label("Slurm Constraint")
-                yield Input(value=str(self.cfg["slurm"].get("constraint", "")), id="slurm_constraint")
-                yield Label("Slurm Nodelist")
-                yield Input(value=str(self.cfg["slurm"].get("nodelist", "")), id="slurm_nodelist")
-                yield Label("Smoke")
-                yield Switch(value=False, id="smoke")
-                yield Label("Force")
-                yield Switch(value=False, id="force")
-                yield Label("Execution")
-                yield Button("Execute Local", id="queue_local", variant="primary")
-                yield Button("Execute Slurm", id="queue_slurm", variant="success")
-                yield Button("Interactive Slurm Smoke", id="queue_interactive")
-                yield Static(classes="spacer")
-                yield Button("Refresh Checkpoints", id="refresh_checkpoints")
-                yield Button("Refresh GPUs/Jobs", id="refresh_slurm")
-                yield Static(classes="spacer")
-                yield Label("Analyze Dataset")
-                yield Input(placeholder="repoeval", id="analysis_dataset")
-                yield Label("Analyze Runs (space-separated NAME=PATH)")
-                yield Input(placeholder="base=/.../raw.jsonl ckpt=/.../raw.jsonl", id="analysis_runs")
-                yield Button("Run Analysis", id="run_analysis", variant="warning")
+        with TabbedContent(initial="benchmark_tab"):
+            with TabPane("Benchmark", id="benchmark_tab"):
+                with Horizontal(id="benchmark_main"):
+                    with Vertical(id="controls"):
+                        yield Label("Benchmark")
+                        yield Select(options=benchmark_options, value="repoeval", id="benchmark")
+                        yield Label("COIR Group")
+                        yield Select(options=group_options, value="all", id="dataset_group")
+                        yield Label("Model Profile")
+                        default_profile = model_options[0][1]
+                        yield Select(options=model_options, value=default_profile, id="model_profile")
+                        yield Label("Checkpoint Step (optional)")
+                        yield Input(placeholder="e.g. 3000", id="checkpoint_step")
+                        yield Label("Slurm GPUs")
+                        yield Input(value=str(self.cfg["slurm"].get("gpus", 1)), id="slurm_gpus")
+                        yield Label("Slurm Constraint")
+                        yield Input(value=str(self.cfg["slurm"].get("constraint", "")), id="slurm_constraint")
+                        yield Label("Slurm Nodelist")
+                        yield Input(value=str(self.cfg["slurm"].get("nodelist", "")), id="slurm_nodelist")
+                        yield Label("Smoke")
+                        yield Switch(value=False, id="smoke")
+                        yield Label("Force")
+                        yield Switch(value=False, id="force")
+                        yield Label("Execution")
+                        yield Button("Execute Local", id="queue_local", variant="primary")
+                        yield Button("Execute Slurm", id="queue_slurm", variant="success")
+                        yield Button("Interactive Slurm Smoke", id="queue_interactive")
+                        yield Static(classes="spacer")
+                        yield Button("Refresh Checkpoints", id="refresh_checkpoints")
+                        yield Static(classes="spacer")
+                        yield Label("Analyze Dataset")
+                        yield Input(placeholder="repoeval", id="analysis_dataset")
+                        yield Label("Analyze Runs (space-separated NAME=PATH)")
+                        yield Input(placeholder="base=/.../raw.jsonl ckpt=/.../raw.jsonl", id="analysis_runs")
+                        yield Button("Run Analysis", id="run_analysis", variant="warning")
 
-            with Vertical(id="status"):
-                yield Static("Checkpoints: loading...", id="checkpoint_summary")
-                yield Label("GPU Availability")
-                yield DataTable(id="gpu_table")
-                yield Label("Slurm Queue")
-                yield DataTable(id="jobs_table")
-                yield RichLog(id="log", highlight=True, markup=False)
+                    with Vertical(id="status"):
+                        yield Static("Checkpoints: loading...", id="checkpoint_summary")
+                        yield RichLog(id="log", highlight=True, markup=False)
+
+            with TabPane("Slurm", id="slurm_tab"):
+                with Horizontal(id="slurm_main"):
+                    with Vertical(id="slurm_filters"):
+                        yield Label("GPU Name Filter (GRES)")
+                        yield Input(placeholder="e.g. a100, h100, rtx", id="gpu_model_filter")
+                        yield Label("GPU RAM >= (GB)")
+                        yield Input(placeholder="e.g. 80", id="gpu_ram_min")
+                        yield Label("Available Only")
+                        yield Switch(value=False, id="gpu_available_only")
+                        yield Static(classes="spacer")
+                        yield Button("Apply Filters", id="apply_gpu_filters")
+                        yield Button("Refresh GPUs/Jobs", id="refresh_slurm")
+
+                    with Vertical(id="slurm_status"):
+                        yield Label("GPU Availability")
+                        yield DataTable(id="gpu_table")
+                        yield Label("Slurm Queue")
+                        yield DataTable(id="jobs_table")
 
         yield Footer()
 
     def on_mount(self) -> None:
         gpu_table = self.query_one("#gpu_table", DataTable)
-        gpu_table.add_columns("node", "partition", "total", "allocated", "available", "state", "gres")
+        gpu_table.add_columns("node", "partition", "total", "allocated", "available", "state", "gres", "model", "ram_gb")
 
         jobs_table = self.query_one("#jobs_table", DataTable)
         jobs_table.add_columns("job_id", "name", "state", "runtime", "nodes", "reason")
@@ -218,8 +253,32 @@ class BenchmarkTuiApp(App[None]):
         tools = slurm_tool_status()
 
         def update() -> None:
-            table.clear()
+            gres_filter = self.query_one("#gpu_model_filter", Input).value.strip().lower()
+            ram_filter_raw = self.query_one("#gpu_ram_min", Input).value.strip()
+            available_only = bool(self.query_one("#gpu_available_only", Switch).value)
+
+            min_ram_gb: int | None = None
+            if ram_filter_raw:
+                try:
+                    min_ram_gb = int(ram_filter_raw)
+                except ValueError:
+                    self._log(f"Ignoring invalid GPU RAM filter '{ram_filter_raw}'. Use an integer GB value.")
+
+            filtered = []
             for node in nodes:
+                if gres_filter:
+                    haystack = f"{node.gpu_model} {node.gres}".lower()
+                    if gres_filter not in haystack:
+                        continue
+                if min_ram_gb is not None:
+                    if node.gpu_ram_gb is None or node.gpu_ram_gb < min_ram_gb:
+                        continue
+                if available_only and node.available_gpus <= 0:
+                    continue
+                filtered.append(node)
+
+            table.clear()
+            for node in filtered:
                 table.add_row(
                     node.node,
                     node.partition,
@@ -228,9 +287,11 @@ class BenchmarkTuiApp(App[None]):
                     str(node.available_gpus),
                     node.state,
                     node.gres,
+                    node.gpu_model or "-",
+                    str(node.gpu_ram_gb) if node.gpu_ram_gb is not None else "-",
                 )
             if nodes:
-                self._log(f"GPU nodes refreshed: {len(nodes)}")
+                self._log(f"GPU nodes refreshed: showing {len(filtered)}/{len(nodes)} nodes after filters.")
                 self._warned_no_gpu_inventory = False
             elif not self._warned_no_gpu_inventory:
                 self._log(
@@ -349,6 +410,8 @@ class BenchmarkTuiApp(App[None]):
             self.refresh_checkpoints_async()
         elif button_id == "refresh_slurm":
             self.refresh_slurm_async()
+        elif button_id == "apply_gpu_filters":
+            self.refresh_gpus_async()
         elif button_id == "queue_local":
             self.queue_run_async(use_slurm=False)
         elif button_id == "queue_slurm":
@@ -367,10 +430,37 @@ class BenchmarkTuiApp(App[None]):
                 node_name = str(row[0])
                 if node_name.startswith("("):
                     return
+                available = int(str(row[4]))
+                model = str(row[7]).strip()
                 self.query_one("#slurm_nodelist", Input).value = node_name
-                self._log(f"Selected node {node_name} for Slurm nodelist.")
+                selected_constraint = "(unchanged)"
+                if model and model != "-":
+                    self.query_one("#slurm_constraint", Input).value = model
+                    selected_constraint = model
+
+                try:
+                    current_gpus = int((self.query_one("#slurm_gpus", Input).value or "1").strip())
+                except ValueError:
+                    current_gpus = 1
+                if available > 0 and current_gpus > available:
+                    self.query_one("#slurm_gpus", Input).value = str(available)
+
+                self._log(
+                    f"Loaded Slurm fields from node {node_name}: "
+                    f"nodelist={node_name}, constraint={selected_constraint}."
+                )
             except Exception:  # noqa: BLE001
                 return
+            return
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id in {"gpu_model_filter", "gpu_ram_min"}:
+            self.refresh_gpus_async()
+            return
+
+    def on_switch_changed(self, event: Switch.Changed) -> None:
+        if event.switch.id == "gpu_available_only":
+            self.refresh_gpus_async()
             return
 
     def action_refresh_all(self) -> None:

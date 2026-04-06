@@ -29,6 +29,15 @@ Default config files:
 - `config/defaults.json` (auto-created)
 - `config/local.json` (your editable overrides)
 
+Cluster scratch auto-detection:
+- When running in a detected cluster environment (e.g. Slurm/PBS/LSF markers), benchmark CLI auto-relocates bulky paths to scratch if available.
+- Relocated paths: `paths.dataset_root`, `paths.results_root`, `paths.cache_dir`, and `paths.repoeval_dataset_path`.
+- Preferred scratch envs (in order): `SCRATCH`, `SLURM_TMPDIR`, `LOCAL_SCRATCH`, `LSCRATCH`, `PBS_JOBFS`, `TMPDIR`.
+- Force a specific scratch root:
+  - `export BENCHMARK_SCRATCH_WORKSPACE=/path/to/scratch`
+- Disable auto-detection:
+  - `export BENCHMARK_DISABLE_SCRATCH_AUTODETECT=1`
+
 ## CLI usage
 
 List HF checkpoints and recommended schedule:
@@ -103,8 +112,9 @@ uv run benchmark tui
 TUI features:
 - Select benchmark/model/checkpoint.
 - Refresh HF checkpoints.
-- Inspect Slurm GPU table from `scontrol/sinfo`.
-- Click a GPU row to auto-fill Slurm `nodelist`.
+- Dedicated `Slurm` tab with GPU + queue tables.
+- Slurm GPU filters: model (`GRES`), minimum GPU RAM, and availability toggle.
+- Click a GPU row to auto-fill Slurm run fields (`nodelist`, suggested `constraint`, and GPU count guard).
 - Queue local or Slurm jobs.
 - Launch interactive `srun --pty` smoke run.
 - Live job panel from `squeue` polling.
@@ -124,8 +134,8 @@ Form fields:
 - `Model Profile`: baseline model profile key from config.
 - `Checkpoint Step`: optional fine-tune checkpoint step, e.g. `3000`.
 - `Slurm GPUs`: GPU count override for queued Slurm jobs.
-- `Slurm Constraint`: optional Slurm constraint string.
-- `Slurm Nodelist`: optional node pinning. Clicking a GPU table row auto-fills this.
+- `Slurm Constraint`: optional Slurm constraint string (auto-suggested from selected GPU row).
+- `Slurm Nodelist`: optional node pinning (auto-filled from selected GPU row).
 - `Smoke`: run reduced-size sanity execution.
 - `Force`: rerun baseline even if previous results already exist.
 
@@ -134,8 +144,10 @@ Buttons:
 - `Execute Slurm`: submit via `sbatch`.
 - `Interactive Slurm Smoke`: launch `srun --pty` using smoke settings.
 - `Refresh Checkpoints`: refresh HF checkpoint list from configured repo.
-- `Refresh GPUs/Jobs`: refresh Slurm node and queue tables.
 - `Run Analysis`: run positive/failure case analysis using `NAME=/path/raw_results.jsonl` specs.
+- Slurm tab:
+  - `Apply Filters`: apply GPU model/RAM/availability filters.
+  - `Refresh GPUs/Jobs`: refresh Slurm node and queue tables.
 
 Tables/panels:
 - `GPU Availability`: node inventory from Slurm (`scontrol`/`sinfo` fallback).

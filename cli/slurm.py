@@ -21,6 +21,8 @@ class GpuNode:
     available_gpus: int
     state: str
     gres: str
+    gpu_model: str
+    gpu_ram_gb: int | None
 
 
 @dataclass
@@ -51,6 +53,42 @@ def _parse_tres_value(tres: str, key: str) -> int:
     return 0
 
 
+def _parse_gpu_model_from_gres(gres: str) -> str:
+    # Typical patterns:
+    # - gpu:a100:4
+    # - gpu:a100-80gb:4
+    # - gpu:rtx6000:2,mps:...
+    match = re.search(r"(?:^|,)\s*gpu:([^:,()]+)", gres)
+    if not match:
+        return ""
+    return match.group(1).strip()
+
+
+def _infer_gpu_ram_gb(gres: str, gpu_model: str) -> int | None:
+    text = f"{gres} {gpu_model}".lower()
+
+    # Prefer explicit "...80gb" style annotations when present.
+    explicit = re.search(r"(\d{2,3})\s*gb\b", text)
+    if explicit:
+        return int(explicit.group(1))
+
+    explicit_g = re.search(r"(\d{2,3})\s*g\b", text)
+    if explicit_g:
+        return int(explicit_g.group(1))
+
+    # Common cluster naming conventions.
+    if "a100" in text and "80" in text:
+        return 80
+    if "a100" in text and "40" in text:
+        return 40
+    if "h100" in text and "94" in text:
+        return 94
+    if "h100" in text and "80" in text:
+        return 80
+
+    return None
+
+
 def slurm_tool_status() -> dict[str, bool]:
     return {
         "scontrol": shutil.which("scontrol") is not None,
@@ -78,6 +116,8 @@ def _local_gpu_fallback() -> list[GpuNode]:
                 available_gpus=0,
                 state="unavailable",
                 gres="no-slurm-tools-and-no-local-cuda",
+                gpu_model="",
+                gpu_ram_gb=None,
             )
         ]
     return [
@@ -89,6 +129,8 @@ def _local_gpu_fallback() -> list[GpuNode]:
             available_gpus=count,
             state="local",
             gres=f"gpu:{count}",
+            gpu_model="local",
+            gpu_ram_gb=None,
         )
     ]
 
@@ -106,6 +148,8 @@ def _diagnostic_gpu_row(reason: str) -> list[GpuNode]:
             available_gpus=0,
             state="unavailable",
             gres=short_reason or "no-gpu-data-reported",
+            gpu_model="",
+            gpu_ram_gb=None,
         )
     ]
 
@@ -134,6 +178,8 @@ def list_gpu_nodes() -> list[GpuNode]:
                     total = int(match.group(1))
             if total <= 0:
                 continue
+            gpu_model = _parse_gpu_model_from_gres(gres)
+            gpu_ram_gb = _infer_gpu_ram_gb(gres, gpu_model)
             nodes.append(
                 GpuNode(
                     node=node,
@@ -143,6 +189,8 @@ def list_gpu_nodes() -> list[GpuNode]:
                     available_gpus=max(total - allocated, 0),
                     state=state,
                     gres=gres,
+                    gpu_model=gpu_model,
+                    gpu_ram_gb=gpu_ram_gb,
                 )
             )
         if nodes:
@@ -166,6 +214,8 @@ def list_gpu_nodes() -> list[GpuNode]:
         if not match:
             continue
         total = int(match.group(1))
+        gpu_model = _parse_gpu_model_from_gres(gres)
+        gpu_ram_gb = _infer_gpu_ram_gb(gres, gpu_model)
         nodes.append(
             GpuNode(
                 node=node,
@@ -175,6 +225,8 @@ def list_gpu_nodes() -> list[GpuNode]:
                 available_gpus=total,
                 state=state,
                 gres=gres,
+                gpu_model=gpu_model,
+                gpu_ram_gb=gpu_ram_gb,
             )
         )
     if nodes:

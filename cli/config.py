@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
@@ -9,6 +10,120 @@ from typing import Any
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "config" / "defaults.json"
 USER_CONFIG_PATH = PROJECT_ROOT / "config" / "local.json"
+_REPOEVAL_METADATA_REL = Path("repoeval_metadata") / "function_level_completion_2k_context_codex.test.clean.jsonl"
+
+_SCRATCH_ENV_VARS = (
+    "SCRATCH",
+    "SLURM_TMPDIR",
+    "LOCAL_SCRATCH",
+    "LSCRATCH",
+    "PBS_JOBFS",
+    "TMPDIR",
+)
+
+_CLUSTER_MARKERS = (
+    "SLURM_CLUSTER_NAME",
+    "SLURM_JOB_ID",
+    "SLURM_SUBMIT_DIR",
+    "SLURM_JOB_USER",
+    "PBS_JOBID",
+    "LSB_JOBID",
+)
+
+
+def _as_bool_env(value: str | None) -> bool:
+    if value is None:
+        return False
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _path_is_under(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def _first_writable_dir(candidates: list[Path]) -> Path | None:
+    for candidate in candidates:
+        try:
+            expanded = candidate.expanduser()
+            expanded.mkdir(parents=True, exist_ok=True)
+            if expanded.is_dir() and os.access(expanded, os.W_OK):
+                return expanded
+        except OSError:
+            continue
+    return None
+
+
+def _detect_scratch_workspace() -> tuple[Path | None, str | None]:
+    explicit = os.environ.get("BENCHMARK_SCRATCH_WORKSPACE", "").strip()
+    if explicit:
+        return Path(explicit).expanduser(), "BENCHMARK_SCRATCH_WORKSPACE"
+
+    if _as_bool_env(os.environ.get("BENCHMARK_DISABLE_SCRATCH_AUTODETECT")):
+        return None, None
+
+    in_cluster = any(os.environ.get(marker, "").strip() for marker in _CLUSTER_MARKERS)
+    if not in_cluster:
+        return None, None
+
+    env_candidates: list[Path] = []
+    for key in _SCRATCH_ENV_VARS:
+        raw = os.environ.get(key, "").strip()
+        if raw:
+            env_candidates.append(Path(raw))
+    scratch = _first_writable_dir(env_candidates)
+    if scratch is not None:
+        return scratch, "env_scratch"
+
+    user = os.environ.get("USER", "").strip()
+    fallback_candidates = []
+    if user:
+        fallback_candidates.append(Path("/scratch") / user)
+    fallback_candidates.append(Path("/scratch"))
+    scratch = _first_writable_dir(fallback_candidates)
+    if scratch is not None:
+        return scratch, "fallback_scratch"
+
+    return None, None
+
+
+def _apply_scratch_workspace_paths(config: dict[str, Any]) -> None:
+    scratch_root, source = _detect_scratch_workspace()
+    if scratch_root is None:
+        return
+
+    workspace_root = (scratch_root / "benchmark_cli").expanduser()
+    paths = config.setdefault("paths", {})
+
+    def maybe_relocate(key: str, target: Path) -> None:
+        raw = paths.get(key)
+        if raw is None:
+            paths[key] = str(target)
+            return
+        current = Path(str(raw)).expanduser()
+        if _path_is_under(current, PROJECT_ROOT):
+            paths[key] = str(target)
+
+    dataset_root = workspace_root / "datasets"
+    results_root = workspace_root / "results"
+    cache_dir = workspace_root / "cache" / "retrieval_embeddings"
+    repoeval_dataset_path = dataset_root / _REPOEVAL_METADATA_REL
+
+    maybe_relocate("dataset_root", dataset_root)
+    maybe_relocate("results_root", results_root)
+    maybe_relocate("cache_dir", cache_dir)
+    maybe_relocate("repoeval_dataset_path", repoeval_dataset_path)
+
+    for key in ("dataset_root", "results_root", "cache_dir"):
+        value = paths.get(key)
+        if value:
+            Path(str(value)).expanduser().mkdir(parents=True, exist_ok=True)
+
+    paths["workspace_root"] = str(workspace_root)
+    paths["workspace_source"] = source
 
 
 def _default_config() -> dict[str, Any]:
@@ -18,7 +133,7 @@ def _default_config() -> dict[str, Any]:
             "results_root": str(PROJECT_ROOT / "results"),
             "cache_dir": str(PROJECT_ROOT / "cache" / "retrieval_embeddings"),
             "repoeval_dataset_path": str(
-                PROJECT_ROOT / "datasets" / "repoeval_metadata" / "function_level_completion_2k_context_codex.test.clean.jsonl"
+                PROJECT_ROOT / "datasets" / _REPOEVAL_METADATA_REL
             ),
         },
         "models": {
@@ -148,6 +263,7 @@ def load_config() -> dict[str, Any]:
         merged = _deep_merge(base, user_cfg)
     else:
         merged = base
+    _apply_scratch_workspace_paths(merged)
     return merged
 
 
