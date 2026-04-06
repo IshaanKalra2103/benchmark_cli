@@ -240,6 +240,7 @@ def execute_runs(
     run_id: str | None,
     use_slurm: bool,
     slurm_gpus: int | None,
+    slurm_partition: str | None,
     slurm_constraint: str | None,
     slurm_nodelist: str | None,
 ) -> tuple[Path, list[RunExecutionResult]]:
@@ -289,6 +290,7 @@ def execute_runs(
                 log_dir=spec.run_dir,
                 slurm_cfg=config["slurm"],
                 gpus=slurm_gpus,
+                partition=slurm_partition,
                 constraint=slurm_constraint,
                 nodelist=slurm_nodelist,
             )

@@ -91,6 +91,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
             command=command,
             slurm_cfg=cfg["slurm"],
             gpus=args.slurm_gpus,
+            partition=args.slurm_partition,
             constraint=args.slurm_constraint,
             nodelist=args.slurm_nodelist,
         )
@@ -107,6 +108,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         run_id=args.run_id,
         use_slurm=args.slurm,
         slurm_gpus=args.slurm_gpus,
+        slurm_partition=args.slurm_partition,
         slurm_constraint=args.slurm_constraint,
         slurm_nodelist=args.slurm_nodelist,
     )
@@ -218,6 +220,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--slurm", action="store_true", help="Submit with sbatch instead of local execution.")
     run.add_argument("--interactive", action="store_true", help="Run via interactive srun --pty.")
     run.add_argument("--slurm-gpus", type=int, default=None, help="Override GPU count for Slurm jobs.")
+    run.add_argument("--slurm-partition", default=None, help="Override Slurm partition.")
     run.add_argument("--slurm-constraint", default=None, help="Override Slurm constraint string.")
     run.add_argument("--slurm-nodelist", default=None, help="Override Slurm nodelist (comma-separated nodes).")
     run.set_defaults(func=_cmd_run)

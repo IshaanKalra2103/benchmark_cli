@@ -23,6 +23,8 @@ class GpuNode:
     gres: str
     gpu_model: str
     gpu_ram_gb: int | None
+    real_memory_mb: int | None
+    alloc_mem_mb: int | None
 
 
 @dataclass
@@ -51,6 +53,26 @@ def _parse_tres_value(tres: str, key: str) -> int:
             except ValueError:
                 return 0
     return 0
+
+
+def _parse_mem_to_mb(raw: str) -> int | None:
+    value = raw.strip().upper()
+    if not value:
+        return None
+    match = re.match(r"^([0-9]+(?:\.[0-9]+)?)([KMGT])?$", value)
+    if not match:
+        return None
+    number = float(match.group(1))
+    unit = match.group(2) or "M"
+    multipliers = {"K": 1 / 1024.0, "M": 1.0, "G": 1024.0, "T": 1024.0 * 1024.0}
+    return int(number * multipliers[unit])
+
+
+def _parse_alloc_mem_mb(alloc_tres: str) -> int | None:
+    for chunk in alloc_tres.split(","):
+        if chunk.startswith("mem="):
+            return _parse_mem_to_mb(chunk.split("=", 1)[1])
+    return None
 
 
 def _parse_gpu_model_from_gres(gres: str) -> str:
@@ -118,6 +140,8 @@ def _local_gpu_fallback() -> list[GpuNode]:
                 gres="no-slurm-tools-and-no-local-cuda",
                 gpu_model="",
                 gpu_ram_gb=None,
+                real_memory_mb=None,
+                alloc_mem_mb=None,
             )
         ]
     return [
@@ -131,6 +155,8 @@ def _local_gpu_fallback() -> list[GpuNode]:
             gres=f"gpu:{count}",
             gpu_model="local",
             gpu_ram_gb=None,
+            real_memory_mb=None,
+            alloc_mem_mb=None,
         )
     ]
 
@@ -150,6 +176,8 @@ def _diagnostic_gpu_row(reason: str) -> list[GpuNode]:
             gres=short_reason or "no-gpu-data-reported",
             gpu_model="",
             gpu_ram_gb=None,
+            real_memory_mb=None,
+            alloc_mem_mb=None,
         )
     ]
 
@@ -170,6 +198,13 @@ def list_gpu_nodes() -> list[GpuNode]:
             gres = parts.get("Gres", "")
             cfg_tres = parts.get("CfgTRES", "")
             alloc_tres = parts.get("AllocTRES", "")
+            real_memory_mb = None
+            try:
+                if parts.get("RealMemory"):
+                    real_memory_mb = int(parts["RealMemory"])
+            except ValueError:
+                real_memory_mb = None
+            alloc_mem_mb = _parse_alloc_mem_mb(alloc_tres)
             total = _parse_tres_value(cfg_tres, "gres/gpu")
             allocated = _parse_tres_value(alloc_tres, "gres/gpu")
             if total <= 0 and "gpu:" in gres:
@@ -191,13 +226,15 @@ def list_gpu_nodes() -> list[GpuNode]:
                     gres=gres,
                     gpu_model=gpu_model,
                     gpu_ram_gb=gpu_ram_gb,
+                    real_memory_mb=real_memory_mb,
+                    alloc_mem_mb=alloc_mem_mb,
                 )
             )
         if nodes:
             return sorted(nodes, key=lambda x: (x.partition, x.node))
 
     # fallback to sinfo
-    fallback = _run(["sinfo", "-N", "-h", "-o", "%N|%P|%G|%t"])
+    fallback = _run(["sinfo", "-N", "-h", "-o", "%N|%P|%G|%t|%m"])
     if fallback.returncode != 0:
         local_fallback = _local_gpu_fallback()
         if local_fallback:
@@ -209,7 +246,16 @@ def list_gpu_nodes() -> list[GpuNode]:
             reasons.append(f"sinfo: {fallback.stderr.strip().splitlines()[0]}")
         return _diagnostic_gpu_row("; ".join(reasons))
     for row in fallback.stdout.splitlines():
-        node, partition, gres, state = row.split("|", 3)
+        fields = row.split("|")
+        if len(fields) < 4:
+            continue
+        node, partition, gres, state = fields[:4]
+        real_memory_mb = None
+        if len(fields) >= 5:
+            try:
+                real_memory_mb = int(fields[4])
+            except ValueError:
+                real_memory_mb = None
         match = re.search(r"gpu(?::[^:]+)?:([0-9]+)", gres)
         if not match:
             continue
@@ -227,6 +273,8 @@ def list_gpu_nodes() -> list[GpuNode]:
                 gres=gres,
                 gpu_model=gpu_model,
                 gpu_ram_gb=gpu_ram_gb,
+                real_memory_mb=real_memory_mb,
+                alloc_mem_mb=None,
             )
         )
     if nodes:
@@ -267,6 +315,7 @@ def build_sbatch_command(
     log_dir: Path,
     slurm_cfg: dict[str, Any],
     gpus: int | None = None,
+    partition: str | None = None,
     constraint: str | None = None,
     nodelist: str | None = None,
 ) -> tuple[list[str], Path]:
@@ -278,8 +327,9 @@ def build_sbatch_command(
     script_path.write_text(script_body, encoding="utf-8")
 
     cmd = ["sbatch", "--job-name", job_name]
-    if slurm_cfg.get("partition"):
-        cmd.extend(["--partition", str(slurm_cfg["partition"])])
+    final_partition = partition if partition is not None else slurm_cfg.get("partition", "")
+    if final_partition:
+        cmd.extend(["--partition", str(final_partition)])
     if slurm_cfg.get("account"):
         cmd.extend(["--account", str(slurm_cfg["account"])])
     if slurm_cfg.get("qos"):
@@ -319,6 +369,7 @@ def submit_sbatch(
     log_dir: Path,
     slurm_cfg: dict[str, Any],
     gpus: int | None = None,
+    partition: str | None = None,
     constraint: str | None = None,
     nodelist: str | None = None,
 ) -> tuple[str | None, str, Path]:
@@ -328,6 +379,7 @@ def submit_sbatch(
         log_dir=log_dir,
         slurm_cfg=slurm_cfg,
         gpus=gpus,
+        partition=partition,
         constraint=constraint,
         nodelist=nodelist,
     )
@@ -349,13 +401,15 @@ def submit_sbatch_array_wrap(
     slurm_cfg: dict[str, Any],
     array: str,
     gpus: int | None = None,
+    partition: str | None = None,
     constraint: str | None = None,
     nodelist: str | None = None,
 ) -> tuple[str | None, str]:
     log_dir.mkdir(parents=True, exist_ok=True)
     cmd = ["sbatch", "--job-name", job_name, "--array", array]
-    if slurm_cfg.get("partition"):
-        cmd.extend(["--partition", str(slurm_cfg["partition"])])
+    final_partition = partition if partition is not None else slurm_cfg.get("partition", "")
+    if final_partition:
+        cmd.extend(["--partition", str(final_partition)])
     if slurm_cfg.get("account"):
         cmd.extend(["--account", str(slurm_cfg["account"])])
     if slurm_cfg.get("qos"):
@@ -402,12 +456,14 @@ def launch_interactive_srun(
     command: list[str],
     slurm_cfg: dict[str, Any],
     gpus: int | None = None,
+    partition: str | None = None,
     constraint: str | None = None,
     nodelist: str | None = None,
 ) -> int:
     cmd = ["srun", "--pty"]
-    if slurm_cfg.get("partition"):
-        cmd.extend(["--partition", str(slurm_cfg["partition"])])
+    final_partition = partition if partition is not None else slurm_cfg.get("partition", "")
+    if final_partition:
+        cmd.extend(["--partition", str(final_partition)])
     if slurm_cfg.get("account"):
         cmd.extend(["--account", str(slurm_cfg["account"])])
     if slurm_cfg.get("qos"):

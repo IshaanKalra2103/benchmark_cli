@@ -113,8 +113,8 @@ TUI features:
 - Select benchmark/model/checkpoint.
 - Refresh HF checkpoints.
 - Dedicated `Slurm` tab with GPU + queue tables.
-- Slurm GPU filters: model (`GRES`), minimum GPU RAM, and availability toggle.
-- Click a GPU row to auto-fill Slurm run fields (`nodelist`, suggested `constraint`, and GPU count guard).
+- Slurm GPU filters: model (`GRES`), minimum GPU RAM, state dropdown, and availability toggle.
+- Click a GPU row to auto-fill Slurm run fields (`partition`, `nodelist`, suggested `constraint`, and GPU count guard).
 - Queue local or Slurm jobs.
 - Launch interactive `srun --pty` smoke run.
 - Live job panel from `squeue` polling.
@@ -134,6 +134,7 @@ Form fields:
 - `Model Profile`: baseline model profile key from config.
 - `Checkpoint Step`: optional fine-tune checkpoint step, e.g. `3000`.
 - `Slurm GPUs`: GPU count override for queued Slurm jobs.
+- `Slurm Partition`: optional partition override for queued Slurm jobs.
 - `Slurm Constraint`: optional Slurm constraint string (auto-suggested from selected GPU row).
 - `Slurm Nodelist`: optional node pinning (auto-filled from selected GPU row).
 - `Smoke`: run reduced-size sanity execution.
@@ -146,7 +147,8 @@ Buttons:
 - `Refresh Checkpoints`: refresh HF checkpoint list from configured repo.
 - `Run Analysis`: run positive/failure case analysis using `NAME=/path/raw_results.jsonl` specs.
 - Slurm tab:
-  - `Apply Filters`: apply GPU model/RAM/availability filters.
+  - `Quick Filters`: `H100 Only`, `A100 Only`, `Idle + Available`.
+  - `Apply Filters`: apply GPU model/RAM/state/availability filters.
   - `Refresh GPUs/Jobs`: refresh Slurm node and queue tables.
 
 Tables/panels:
