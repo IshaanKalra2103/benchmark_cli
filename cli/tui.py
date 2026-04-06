@@ -25,17 +25,28 @@ from textual.widgets import (
 from .checkpoints import list_hf_checkpoints
 from .config import load_config
 from .runner import execute_runs, run_analysis, visible_model_profiles
-from .slurm import GpuNode, launch_interactive_srun, list_gpu_nodes, list_jobs, slurm_tool_status
+from .slurm import launch_interactive_srun, list_jobs, slurm_tool_status
 
 
 class BenchmarkTuiApp(App[None]):
     CSS = """
     Screen {
       layout: vertical;
+      background: rgb(16, 18, 22);
+      color: rgb(236, 238, 242);
     }
 
-    #benchmark_main, #slurm_main {
+    Header, Footer {
+      background: rgb(24, 26, 31);
+    }
+
+    TabbedContent, TabPane {
+      background: rgb(16, 18, 22);
+    }
+
+    #benchmark_main {
       height: 1fr;
+      background: rgb(16, 18, 22);
     }
 
     #controls {
@@ -43,42 +54,40 @@ class BenchmarkTuiApp(App[None]):
       padding: 1;
       border: solid $primary;
       overflow-y: auto;
+      background: rgb(20, 22, 27);
     }
 
     #status {
       width: 1fr;
       padding: 1;
       border: solid $secondary;
-    }
-
-    #slurm_filters {
-      width: 42;
-      padding: 1;
-      border: solid $primary;
-      overflow-y: auto;
+      background: rgb(20, 22, 27);
     }
 
     #slurm_status {
       width: 1fr;
       padding: 1;
       border: solid $secondary;
+      background: rgb(20, 22, 27);
     }
 
     .spacer {
       height: 1;
     }
 
-    #gpu_table {
-      height: 14;
-    }
-
     #jobs_table {
-      height: 10;
+      height: 1fr;
+      background: rgb(20, 22, 27);
     }
 
     #log {
       height: 1fr;
       border: solid $accent;
+      background: rgb(20, 22, 27);
+    }
+
+    DataTable, RichLog {
+      background: rgb(20, 22, 27);
     }
     """
 
@@ -90,10 +99,7 @@ class BenchmarkTuiApp(App[None]):
     def __init__(self) -> None:
         super().__init__()
         self.cfg = load_config()
-        self._warned_no_gpu_inventory = False
         self._warned_no_squeue = False
-        self._gpu_nodes_by_name: dict[str, GpuNode] = {}
-        self._suppress_gpu_state_change = False
 
     def compose(self) -> ComposeResult:
         profiles = visible_model_profiles(self.cfg)
@@ -148,52 +154,16 @@ class BenchmarkTuiApp(App[None]):
                         yield RichLog(id="log", highlight=True, markup=False)
 
             with TabPane("Slurm", id="slurm_tab"):
-                with Horizontal(id="slurm_main"):
-                    with Vertical(id="slurm_filters"):
-                        yield Label("GPU Name Filter (GRES)")
-                        yield Input(placeholder="e.g. a100, h100, rtx", id="gpu_model_filter")
-                        yield Label("GPU RAM >= (GB)")
-                        yield Input(placeholder="e.g. 80", id="gpu_ram_min")
-                        yield Label("State")
-                        yield Select(
-                            options=[
-                                ("All", "all"),
-                                ("IDLE", "IDLE"),
-                                ("MIXED", "MIXED"),
-                                ("ALLOCATED", "ALLOCATED"),
-                                ("PLANNED", "PLANNED"),
-                                ("DOWN", "DOWN"),
-                                ("DRAIN", "DRAIN"),
-                            ],
-                            value="all",
-                            id="gpu_state_filter",
-                        )
-                        yield Label("Available Only")
-                        yield Switch(value=False, id="gpu_available_only")
-                        yield Static(classes="spacer")
-                        yield Label("Quick Filters")
-                        yield Button("H100 Only", id="quick_h100")
-                        yield Button("A100 Only", id="quick_a100")
-                        yield Button("Idle + Available", id="quick_idle_available")
-                        yield Static(classes="spacer")
-                        yield Button("Apply Filters", id="apply_gpu_filters")
-                        yield Button("Refresh GPUs/Jobs", id="refresh_slurm")
-
-                    with Vertical(id="slurm_status"):
-                        yield Static("Select a GPU node row to load Slurm run settings.", id="gpu_selection_info")
-                        yield Label("GPU Availability")
-                        yield DataTable(id="gpu_table")
-                        yield Label("Slurm Queue")
-                        yield DataTable(id="jobs_table")
+                with Vertical(id="slurm_status"):
+                    yield Label("Queued sbatch Jobs")
+                    yield Button("Refresh Queue", id="refresh_slurm")
+                    yield DataTable(id="jobs_table")
 
         yield Footer()
 
     def on_mount(self) -> None:
-        gpu_table = self.query_one("#gpu_table", DataTable)
-        gpu_table.add_columns("node", "partition", "total", "allocated", "available", "state", "gres", "model", "ram_gb")
-
         jobs_table = self.query_one("#jobs_table", DataTable)
-        jobs_table.add_columns("job_id", "name", "state", "runtime", "nodes", "gpu_model", "gpu_ram_gb", "progress", "reason")
+        jobs_table.add_columns("job_id", "name", "state", "time_in_queue", "nodes", "reason")
 
         self.refresh_all_async()
         poll_sec = int(self.cfg["slurm"].get("poll_interval_sec", 10))
@@ -241,51 +211,6 @@ class BenchmarkTuiApp(App[None]):
             "slurm_nodelist": slurm_nodelist,
         }
 
-    def _update_selected_gpu_info(self, node: GpuNode | None) -> None:
-        if node is None:
-            self.query_one("#gpu_selection_info", Static).update("Select a GPU node row to load Slurm run settings.")
-            return
-        gpu_ram = f"{node.gpu_ram_gb} GB" if node.gpu_ram_gb is not None else "unknown"
-        node_ram = f"{node.real_memory_mb // 1024} GB" if node.real_memory_mb is not None else "unknown"
-        alloc_mem = f"{node.alloc_mem_mb // 1024} GB" if node.alloc_mem_mb is not None else "unknown"
-        text = (
-            f"Selected node: {node.node} | partition={node.partition} | state={node.state}\n"
-            f"GPU model={node.gpu_model or 'unknown'} | GPU RAM={gpu_ram} | "
-            f"GPUs {node.available_gpus}/{node.total_gpus} available | "
-            f"Node RAM={node_ram} (allocated={alloc_mem})\n"
-            "Selecting a row auto-fills Benchmark tab Slurm fields."
-        )
-        self.query_one("#gpu_selection_info", Static).update(text)
-
-    def _apply_quick_filter(self, preset: str) -> None:
-        model_input = self.query_one("#gpu_model_filter", Input)
-        ram_input = self.query_one("#gpu_ram_min", Input)
-        state_select = self.query_one("#gpu_state_filter", Select)
-        available_switch = self.query_one("#gpu_available_only", Switch)
-
-        if preset == "h100":
-            model_input.value = "h100"
-            ram_input.value = ""
-            state_select.value = "all"
-            available_switch.value = False
-            self._log("Applied quick filter: H100 only.")
-        elif preset == "a100":
-            model_input.value = "a100"
-            ram_input.value = ""
-            state_select.value = "all"
-            available_switch.value = False
-            self._log("Applied quick filter: A100 only.")
-        elif preset == "idle_available":
-            model_input.value = ""
-            ram_input.value = ""
-            state_select.value = "IDLE"
-            available_switch.value = True
-            self._log("Applied quick filter: IDLE + available GPUs.")
-        else:
-            return
-
-        self.refresh_gpus_async()
-
     @work(thread=True)
     def refresh_all_async(self) -> None:
         self.refresh_checkpoints_async()
@@ -314,128 +239,24 @@ class BenchmarkTuiApp(App[None]):
 
     @work(thread=True)
     def refresh_slurm_async(self) -> None:
-        self.refresh_gpus_async()
         self.refresh_jobs_async()
-
-    @work(thread=True)
-    def refresh_gpus_async(self) -> None:
-        table = self.query_one("#gpu_table", DataTable)
-        nodes = list_gpu_nodes()
-        tools = slurm_tool_status()
-
-        def update() -> None:
-            gres_filter = self.query_one("#gpu_model_filter", Input).value.strip().lower()
-            ram_filter_raw = self.query_one("#gpu_ram_min", Input).value.strip()
-            state_select = self.query_one("#gpu_state_filter", Select)
-            current_state = state_select.value if isinstance(state_select.value, str) else "all"
-            states = sorted({node.state.upper() for node in nodes if node.state})
-            state_options = [("All", "all")] + [(state, state) for state in states]
-            valid_values = {value for _, value in state_options}
-            if current_state not in valid_values:
-                current_state = "all"
-            self._suppress_gpu_state_change = True
-            state_select.set_options(state_options)
-            state_select.value = current_state
-            self._suppress_gpu_state_change = False
-            state_filter = current_state
-            available_only = bool(self.query_one("#gpu_available_only", Switch).value)
-
-            min_ram_gb: int | None = None
-            if ram_filter_raw:
-                try:
-                    min_ram_gb = int(ram_filter_raw)
-                except ValueError:
-                    self._log(f"Ignoring invalid GPU RAM filter '{ram_filter_raw}'. Use an integer GB value.")
-
-            filtered = []
-            for node in nodes:
-                if gres_filter:
-                    haystack = f"{node.gpu_model} {node.gres}".lower()
-                    if gres_filter not in haystack:
-                        continue
-                if min_ram_gb is not None:
-                    if node.gpu_ram_gb is None or node.gpu_ram_gb < min_ram_gb:
-                        continue
-                if state_filter != "all" and node.state.upper() != state_filter:
-                    continue
-                if available_only and node.available_gpus <= 0:
-                    continue
-                filtered.append(node)
-
-            self._gpu_nodes_by_name = {node.node: node for node in nodes}
-            table.clear()
-            for node in filtered:
-                table.add_row(
-                    node.node,
-                    node.partition,
-                    str(node.total_gpus),
-                    str(node.allocated_gpus),
-                    str(node.available_gpus),
-                    node.state,
-                    node.gres,
-                    node.gpu_model or "-",
-                    str(node.gpu_ram_gb) if node.gpu_ram_gb is not None else "-",
-                )
-            selected_nodelist = self.query_one("#slurm_nodelist", Input).value.strip()
-            self._update_selected_gpu_info(self._gpu_nodes_by_name.get(selected_nodelist))
-            if nodes:
-                self._warned_no_gpu_inventory = False
-            elif not self._warned_no_gpu_inventory:
-                self._log(
-                    "No GPU inventory found. "
-                    f"slurm_tools(scontrol={tools['scontrol']}, sinfo={tools['sinfo']})"
-                )
-                self._warned_no_gpu_inventory = True
-
-        self.call_from_thread(update)
 
     @work(thread=True)
     def refresh_jobs_async(self) -> None:
         table = self.query_one("#jobs_table", DataTable)
         user = os.environ.get("USER", "")
-        jobs = list_jobs(user=user)
+        jobs = [job for job in list_jobs(user=user) if job.state.upper() == "PENDING"]
         tools = slurm_tool_status()
-
-        def first_node(raw: str) -> str | None:
-            value = (raw or "").strip()
-            if not value:
-                return None
-            if "(" in value:
-                return None
-            if "[" not in value:
-                return value
-            # Example: tron[62-63] -> tron62
-            prefix, rest = value.split("[", 1)
-            inside = rest.split("]", 1)[0]
-            token = inside.split(",", 1)[0]
-            if "-" in token:
-                token = token.split("-", 1)[0]
-            if not token:
-                return None
-            return f"{prefix}{token}"
 
         def update() -> None:
             table.clear()
             for job in jobs:
-                node_name = first_node(job.reason)
-                node = self._gpu_nodes_by_name.get(node_name) if node_name else None
-                gpu_model = node.gpu_model if node and node.gpu_model else "-"
-                gpu_ram = str(node.gpu_ram_gb) if node and node.gpu_ram_gb is not None else "-"
-                if job.state.upper() == "RUNNING":
-                    progress = f"running {job.runtime}"
-                elif job.state.upper() == "PENDING":
-                    progress = f"waiting ({job.reason})"
-                else:
-                    progress = job.state.lower()
                 table.add_row(
                     job.job_id,
                     job.name,
                     job.state,
                     job.runtime,
                     job.nodes,
-                    gpu_model,
-                    gpu_ram,
-                    progress,
                     job.reason,
                 )
             if jobs:
@@ -537,14 +358,6 @@ class BenchmarkTuiApp(App[None]):
             self.refresh_checkpoints_async()
         elif button_id == "refresh_slurm":
             self.refresh_slurm_async()
-        elif button_id == "quick_h100":
-            self._apply_quick_filter("h100")
-        elif button_id == "quick_a100":
-            self._apply_quick_filter("a100")
-        elif button_id == "quick_idle_available":
-            self._apply_quick_filter("idle_available")
-        elif button_id == "apply_gpu_filters":
-            self.refresh_gpus_async()
         elif button_id == "queue_local":
             self.queue_run_async(use_slurm=False)
         elif button_id == "queue_slurm":
@@ -553,60 +366,6 @@ class BenchmarkTuiApp(App[None]):
             self.interactive_smoke_async()
         elif button_id == "run_analysis":
             self.run_analysis_async()
-
-    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
-        if event.data_table.id == "gpu_table":
-            try:
-                row = event.data_table.get_row(event.row_key)
-                if not row:
-                    return
-                node_name = str(row[0])
-                if node_name.startswith("("):
-                    return
-                node = self._gpu_nodes_by_name.get(node_name)
-                if node is None:
-                    return
-                available = int(node.available_gpus)
-                model = node.gpu_model.strip()
-                partition = node.partition.split(",")[0].replace("*", "").strip()
-
-                self.query_one("#slurm_nodelist", Input).value = node_name
-                if partition:
-                    self.query_one("#slurm_partition", Input).value = partition
-                selected_constraint = "(unchanged)"
-                if model and model != "-":
-                    self.query_one("#slurm_constraint", Input).value = model
-                    selected_constraint = model
-
-                try:
-                    current_gpus = int((self.query_one("#slurm_gpus", Input).value or "1").strip())
-                except ValueError:
-                    current_gpus = 1
-                if available > 0 and current_gpus > available:
-                    self.query_one("#slurm_gpus", Input).value = str(available)
-
-                self._update_selected_gpu_info(node)
-                self.query_one(TabbedContent).active = "benchmark_tab"
-            except Exception:  # noqa: BLE001
-                return
-            return
-
-    def on_input_submitted(self, event: Input.Submitted) -> None:
-        if event.input.id in {"gpu_model_filter", "gpu_ram_min"}:
-            self.refresh_gpus_async()
-            return
-
-    def on_switch_changed(self, event: Switch.Changed) -> None:
-        if event.switch.id == "gpu_available_only":
-            self.refresh_gpus_async()
-            return
-
-    def on_select_changed(self, event: Select.Changed) -> None:
-        if event.select.id == "gpu_state_filter":
-            if self._suppress_gpu_state_change:
-                return
-            self.refresh_gpus_async()
-            return
 
     def action_refresh_all(self) -> None:
         self.refresh_all_async()
