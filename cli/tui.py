@@ -93,6 +93,7 @@ class BenchmarkTuiApp(App[None]):
         self._warned_no_gpu_inventory = False
         self._warned_no_squeue = False
         self._gpu_nodes_by_name: dict[str, GpuNode] = {}
+        self._suppress_gpu_state_change = False
 
     def compose(self) -> ComposeResult:
         profiles = visible_model_profiles(self.cfg)
@@ -329,11 +330,13 @@ class BenchmarkTuiApp(App[None]):
             current_state = state_select.value if isinstance(state_select.value, str) else "all"
             states = sorted({node.state.upper() for node in nodes if node.state})
             state_options = [("All", "all")] + [(state, state) for state in states]
-            state_select.set_options(state_options)
             valid_values = {value for _, value in state_options}
             if current_state not in valid_values:
                 current_state = "all"
+            self._suppress_gpu_state_change = True
+            state_select.set_options(state_options)
             state_select.value = current_state
+            self._suppress_gpu_state_change = False
             state_filter = current_state
             available_only = bool(self.query_one("#gpu_available_only", Switch).value)
 
@@ -376,7 +379,6 @@ class BenchmarkTuiApp(App[None]):
             selected_nodelist = self.query_one("#slurm_nodelist", Input).value.strip()
             self._update_selected_gpu_info(self._gpu_nodes_by_name.get(selected_nodelist))
             if nodes:
-                self._log(f"GPU nodes refreshed: showing {len(filtered)}/{len(nodes)} nodes after filters.")
                 self._warned_no_gpu_inventory = False
             elif not self._warned_no_gpu_inventory:
                 self._log(
@@ -563,6 +565,8 @@ class BenchmarkTuiApp(App[None]):
 
     def on_select_changed(self, event: Select.Changed) -> None:
         if event.select.id == "gpu_state_filter":
+            if self._suppress_gpu_state_change:
+                return
             self.refresh_gpus_async()
             return
 
