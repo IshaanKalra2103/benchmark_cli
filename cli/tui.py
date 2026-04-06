@@ -547,10 +547,6 @@ class BenchmarkTuiApp(App[None]):
 
                 self._update_selected_gpu_info(node)
                 self.query_one(TabbedContent).active = "benchmark_tab"
-                self._log(
-                    f"Loaded Slurm fields from node {node_name}: "
-                    f"partition={partition or '(unchanged)'}, nodelist={node_name}, constraint={selected_constraint}."
-                )
             except Exception:  # noqa: BLE001
                 return
             return
