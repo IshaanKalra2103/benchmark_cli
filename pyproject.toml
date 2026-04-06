@@ -1,0 +1,35 @@
+[project]
+name = "benchmark-cli"
+version = "0.1.0"
+description = "TUI/CLI benchmark orchestrator for retrieval models with Slurm support."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "beir>=2.0.0",
+    "chardet>=5.2.0",
+    "datasets>=3.0.0",
+    "gitpython>=3.1.43",
+    "huggingface-hub>=0.24.0",
+    "jsonlines>=4.0.0",
+    "numpy>=1.26.0",
+    "requests>=2.32.0",
+    "sentence-transformers>=3.0.0",
+    "textual>=0.79.0",
+    "torch>=2.2.0",
+    "tqdm>=4.66.0",
+    "transformers>=4.45.0",
+    "unidiff>=0.7.5",
+]
+
+[project.scripts]
+benchmark = "cli.commands:main"
+
+[build-system]
+requires = ["hatchling>=1.25.0"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["cli", "benchmarks", "create"]
+
+[tool.uv]
+package = true
