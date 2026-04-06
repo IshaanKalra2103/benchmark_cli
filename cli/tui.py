@@ -193,11 +193,11 @@ class BenchmarkTuiApp(App[None]):
         gpu_table.add_columns("node", "partition", "total", "allocated", "available", "state", "gres", "model", "ram_gb")
 
         jobs_table = self.query_one("#jobs_table", DataTable)
-        jobs_table.add_columns("job_id", "name", "state", "runtime", "nodes", "reason")
+        jobs_table.add_columns("job_id", "name", "state", "runtime", "nodes", "gpu_model", "gpu_ram_gb", "progress", "reason")
 
         self.refresh_all_async()
         poll_sec = int(self.cfg["slurm"].get("poll_interval_sec", 10))
-        self.set_interval(poll_sec, self.refresh_jobs_async)
+        self.set_interval(poll_sec, self.refresh_slurm_async)
 
     def _log(self, message: str) -> None:
         stamp = dt.datetime.now().strftime("%H:%M:%S")
@@ -396,10 +396,48 @@ class BenchmarkTuiApp(App[None]):
         jobs = list_jobs(user=user)
         tools = slurm_tool_status()
 
+        def first_node(raw: str) -> str | None:
+            value = (raw or "").strip()
+            if not value:
+                return None
+            if "(" in value:
+                return None
+            if "[" not in value:
+                return value
+            # Example: tron[62-63] -> tron62
+            prefix, rest = value.split("[", 1)
+            inside = rest.split("]", 1)[0]
+            token = inside.split(",", 1)[0]
+            if "-" in token:
+                token = token.split("-", 1)[0]
+            if not token:
+                return None
+            return f"{prefix}{token}"
+
         def update() -> None:
             table.clear()
             for job in jobs:
-                table.add_row(job.job_id, job.name, job.state, job.runtime, job.nodes, job.reason)
+                node_name = first_node(job.reason)
+                node = self._gpu_nodes_by_name.get(node_name) if node_name else None
+                gpu_model = node.gpu_model if node and node.gpu_model else "-"
+                gpu_ram = str(node.gpu_ram_gb) if node and node.gpu_ram_gb is not None else "-"
+                if job.state.upper() == "RUNNING":
+                    progress = f"running {job.runtime}"
+                elif job.state.upper() == "PENDING":
+                    progress = f"waiting ({job.reason})"
+                else:
+                    progress = job.state.lower()
+                table.add_row(
+                    job.job_id,
+                    job.name,
+                    job.state,
+                    job.runtime,
+                    job.nodes,
+                    gpu_model,
+                    gpu_ram,
+                    progress,
+                    job.reason,
+                )
             if jobs:
                 self._warned_no_squeue = False
             if not jobs and not tools["squeue"] and not self._warned_no_squeue:

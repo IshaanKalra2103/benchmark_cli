@@ -388,7 +388,7 @@ def submit_sbatch(
     if proc.returncode != 0:
         return None, output.strip(), script_path
 
-    match = re.search(r"Submitted batch job (\\d+)", proc.stdout or "")
+    match = re.search(r"Submitted batch job (\d+)", proc.stdout or "")
     job_id = match.group(1) if match else None
     return job_id, output.strip(), script_path
 

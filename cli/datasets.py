@@ -74,6 +74,10 @@ def _dataset_command(
             [
                 "--dataset_root",
                 dataset_root,
+                "--source",
+                "hf",
+                "--hf_repo_id",
+                "CoIR-Retrieval/datasets",
                 "--num_shards",
                 str(num_shards),
                 "--shard_id",
@@ -123,7 +127,9 @@ def submit_dataset_download_slurm(
         raise ValueError(f"Unsupported dataset '{dataset}'.")
 
     # Always run from project root so relative outputs match the benchmark_cli workspace.
-    base = ["cd", str(PROJECT_ROOT), "&&", "uv", "run", "python", "-m", module_map[dataset]]
+    base = f"cd {shlex.quote(str(PROJECT_ROOT))} && uv run python -m {module_map[dataset]}"
+
+    shard_token = "__SLURM_ARRAY_TASK_ID__"
 
     if dataset == "swe-bench-lite":
         args = [
@@ -133,7 +139,7 @@ def submit_dataset_download_slurm(
             "--output_dir", str(dataset_root),
             "--skip_existing",
             "--num_shards", str(num_shards),
-            "--shard_id", "$SLURM_ARRAY_TASK_ID",
+            "--shard_id", shard_token,
         ]
     elif dataset == "repoeval":
         args = [
@@ -143,16 +149,20 @@ def submit_dataset_download_slurm(
             "--context_length", "2k",
             "--data_cache_dir", str(dataset_root / "repoeval_cache"),
             "--num_shards", str(num_shards),
-            "--shard_id", "$SLURM_ARRAY_TASK_ID",
+            "--shard_id", shard_token,
         ]
     else:
         args = [
             "--dataset_root", str(dataset_root),
+            "--source", "hf",
+            "--hf_repo_id", "CoIR-Retrieval/datasets",
             "--num_shards", str(num_shards),
-            "--shard_id", "$SLURM_ARRAY_TASK_ID",
+            "--shard_id", shard_token,
         ]
 
-    wrap_command = " ".join(shlex.quote(part) for part in base + args)
+    args_str = " ".join(shlex.quote(part) for part in args)
+    wrap_command = f"{base} {args_str}".strip()
+    wrap_command = wrap_command.replace(shlex.quote(shard_token), "$SLURM_ARRAY_TASK_ID")
     array_spec = f"0-{num_shards - 1}"
     job_id, output = submit_sbatch_array_wrap(
         wrap_command=wrap_command,
