@@ -343,7 +343,8 @@ def build_sbatch_command(
 
     gpu_count = int(gpus if gpus is not None else slurm_cfg.get("gpus", 1))
     if gpu_count > 0:
-        cmd.extend(["--gpus", str(gpu_count)])
+        # Use gres syntax for broader Slurm compatibility on this cluster.
+        cmd.extend(["--gres", f"gpu:{gpu_count}"])
 
     final_constraint = constraint if constraint is not None else slurm_cfg.get("constraint", "")
     if final_constraint:
@@ -384,7 +385,7 @@ def submit_sbatch(
         nodelist=nodelist,
     )
     proc = _run(sbatch_cmd)
-    output = (proc.stdout or "") + (proc.stderr or "")
+    output = "$ " + shlex.join(sbatch_cmd) + "\n" + (proc.stdout or "") + (proc.stderr or "")
     if proc.returncode != 0:
         return None, output.strip(), script_path
 
@@ -423,7 +424,7 @@ def submit_sbatch_array_wrap(
 
     gpu_count = int(gpus if gpus is not None else slurm_cfg.get("gpus", 0))
     if gpu_count > 0:
-        cmd.extend(["--gpus", str(gpu_count)])
+        cmd.extend(["--gres", f"gpu:{gpu_count}"])
 
     final_constraint = constraint if constraint is not None else slurm_cfg.get("constraint", "")
     if final_constraint:
@@ -477,7 +478,7 @@ def launch_interactive_srun(
 
     gpu_count = int(gpus if gpus is not None else slurm_cfg.get("gpus", 1))
     if gpu_count > 0:
-        cmd.extend(["--gpus", str(gpu_count)])
+        cmd.extend(["--gres", f"gpu:{gpu_count}"])
 
     final_constraint = constraint if constraint is not None else slurm_cfg.get("constraint", "")
     if final_constraint:

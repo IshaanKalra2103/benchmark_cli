@@ -16,7 +16,25 @@ This repository contains local benchmark scripts under `benchmarks/`; it does no
 ```bash
 cd /Users/ishaankalra/Documents/Dev/benchmark_cli
 uv sync
+cp .env.example .env
 ```
+
+`.env` / `.env.local` are auto-loaded by the CLI and TUI via `cli/config.py` (with `.env.local` taking precedence). Use this to avoid repeating scratch/Slurm flags on every command.
+
+Recommended cluster defaults in `.env`:
+- `BENCHMARK_SCRATCH_WORKSPACE`
+- `BENCHMARK_DATASET_ROOT`
+- `BENCHMARK_RESULTS_ROOT`
+- `BENCHMARK_CACHE_DIR`
+- `BENCHMARK_REPOEVAL_DATASET_PATH`
+- `BENCHMARK_SLURM_PARTITION`
+- `BENCHMARK_SLURM_ACCOUNT`
+- `BENCHMARK_SLURM_QOS`
+- `BENCHMARK_SLURM_TIME`
+- `BENCHMARK_SLURM_MEM`
+- `BENCHMARK_SLURM_GPUS`
+- `BENCHMARK_SLURM_CPUS_PER_TASK`
+- `BENCHMARK_BATCH_SIZE`
 
 ## Initialize config
 
@@ -37,6 +55,13 @@ Cluster scratch auto-detection:
   - `export BENCHMARK_SCRATCH_WORKSPACE=/path/to/scratch`
 - Disable auto-detection:
   - `export BENCHMARK_DISABLE_SCRATCH_AUTODETECT=1`
+
+Precedence for effective config values:
+1. `config/defaults.json`
+2. `config/local.json`
+3. `.env`
+4. `.env.local`
+5. Scratch auto-relocation (unless disabled)
 
 ## CLI usage
 

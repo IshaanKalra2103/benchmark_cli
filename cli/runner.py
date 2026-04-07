@@ -284,9 +284,12 @@ def execute_runs(
             continue
 
         if use_slurm:
+            slurm_job_name = f"{_safe_name(run_id)}__bench_{_safe_name(dataset)}_{_safe_name(spec.model.name)}"
+            if len(slurm_job_name) > 120:
+                slurm_job_name = slurm_job_name[:120]
             job_id, output, script_path = submit_sbatch(
                 command=cmd,
-                job_name=f"bench_{_safe_name(dataset)}_{_safe_name(spec.model.name)}",
+                job_name=slurm_job_name,
                 log_dir=spec.run_dir,
                 slurm_cfg=config["slurm"],
                 gpus=slurm_gpus,

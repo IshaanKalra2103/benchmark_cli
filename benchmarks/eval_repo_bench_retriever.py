@@ -76,14 +76,39 @@ def encode_texts(
     if not texts:
         dim = model.get_sentence_embedding_dimension()
         return np.zeros((0, dim), dtype=np.float32)
-    embeddings = model.encode(
-        texts,
-        batch_size=batch_size,
-        show_progress_bar=True,
-        normalize_embeddings=normalize_embeddings,
-        convert_to_numpy=True,
-    )
-    return embeddings.astype(np.float32)
+    effective_batch_size = max(1, int(batch_size))
+    while True:
+        try:
+            embeddings = model.encode(
+                texts,
+                batch_size=effective_batch_size,
+                show_progress_bar=True,
+                normalize_embeddings=normalize_embeddings,
+                convert_to_numpy=True,
+            )
+            return embeddings.astype(np.float32)
+        except torch.OutOfMemoryError:
+            if effective_batch_size <= 1:
+                raise
+            next_batch_size = max(1, effective_batch_size // 2)
+            print(
+                f"[warn] CUDA OOM while encoding {desc} at batch_size={effective_batch_size}; retrying with batch_size={next_batch_size}",
+                flush=True,
+            )
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            effective_batch_size = next_batch_size
+        except RuntimeError as exc:
+            if "out of memory" not in str(exc).lower() or effective_batch_size <= 1:
+                raise
+            next_batch_size = max(1, effective_batch_size // 2)
+            print(
+                f"[warn] Runtime OOM while encoding {desc} at batch_size={effective_batch_size}; retrying with batch_size={next_batch_size}",
+                flush=True,
+            )
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            effective_batch_size = next_batch_size
 
 
 def cache_paths(
