@@ -27,6 +27,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--query_prefix", type=str, default="")
     parser.add_argument("--doc_prefix", type=str, default="")
+    parser.add_argument(
+        "--query_prompt_name",
+        type=str,
+        default=None,
+        help="Optional SentenceTransformer prompt name for query encoding (e.g. 'query').",
+    )
+    parser.add_argument(
+        "--doc_prompt_name",
+        type=str,
+        default=None,
+        help="Optional SentenceTransformer prompt name for document encoding.",
+    )
     parser.add_argument("--normalize_embeddings", action="store_true")
     parser.add_argument("--trust_remote_code", action="store_true")
     parser.add_argument("--device", type=str, default=None, help="e.g. cuda, cuda:0, cpu.")
@@ -72,6 +84,7 @@ def encode_texts(
     batch_size: int,
     normalize_embeddings: bool,
     desc: str,
+    prompt_name: str | None = None,
 ) -> np.ndarray:
     if not texts:
         dim = model.get_sentence_embedding_dimension()
@@ -79,13 +92,15 @@ def encode_texts(
     effective_batch_size = max(1, int(batch_size))
     while True:
         try:
-            embeddings = model.encode(
-                texts,
-                batch_size=effective_batch_size,
-                show_progress_bar=True,
-                normalize_embeddings=normalize_embeddings,
-                convert_to_numpy=True,
-            )
+            encode_kwargs: dict[str, Any] = {
+                "batch_size": effective_batch_size,
+                "show_progress_bar": True,
+                "normalize_embeddings": normalize_embeddings,
+                "convert_to_numpy": True,
+            }
+            if prompt_name:
+                encode_kwargs["prompt_name"] = prompt_name
+            embeddings = model.encode(texts, **encode_kwargs)
             return embeddings.astype(np.float32)
         except torch.OutOfMemoryError:
             if effective_batch_size <= 1:
@@ -118,14 +133,16 @@ def cache_paths(
     model_name: str,
     normalize_embeddings: bool,
     doc_prefix: str,
+    doc_prompt_name: str | None,
 ) -> tuple[Path, Path]:
     model_tag = safe_name(model_name)
     prefix_tag = text_hash(doc_prefix)
+    doc_prompt_tag = text_hash(doc_prompt_name or "")
     cache_base = (
         Path(cache_dir)
         / dataset
         / instance_dir
-        / f"{model_tag}__norm{int(normalize_embeddings)}__pref{prefix_tag}"
+        / f"{model_tag}__norm{int(normalize_embeddings)}__pref{prefix_tag}__dprompt{doc_prompt_tag}"
     )
     return cache_base.with_suffix(".ids.json"), cache_base.with_suffix(".emb.npy")
 
@@ -144,6 +161,7 @@ def load_or_encode_doc_embeddings(
         model_name=args.model,
         normalize_embeddings=args.normalize_embeddings,
         doc_prefix=args.doc_prefix,
+        doc_prompt_name=args.doc_prompt_name,
     )
 
     if not args.no_cache and ids_path.exists() and emb_path.exists():
@@ -158,6 +176,7 @@ def load_or_encode_doc_embeddings(
         batch_size=args.batch_size,
         normalize_embeddings=args.normalize_embeddings,
         desc=f"docs::{instance_dir}",
+        prompt_name=args.doc_prompt_name,
     )
     if not args.no_cache:
         ids_path.parent.mkdir(parents=True, exist_ok=True)
@@ -368,6 +387,10 @@ def build_final_results(
 
 def main() -> None:
     args = parse_args()
+    if args.query_prompt_name == "":
+        args.query_prompt_name = None
+    if args.doc_prompt_name == "":
+        args.doc_prompt_name = None
     Path(args.output_file).parent.mkdir(parents=True, exist_ok=True)
     Path(args.results_file).parent.mkdir(parents=True, exist_ok=True)
     Path(args.raw_results_file).parent.mkdir(parents=True, exist_ok=True)
@@ -423,6 +446,7 @@ def main() -> None:
             batch_size=args.batch_size,
             normalize_embeddings=args.normalize_embeddings,
             desc=f"queries::{instance_dir}",
+            prompt_name=args.query_prompt_name,
         )
 
         candidate_k = min(args.candidate_k, len(doc_ids))

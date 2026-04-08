@@ -146,21 +146,21 @@ def _build_eval_command(config: dict[str, Any], spec: RunSpec, smoke: bool) -> l
         "--model",
         spec.model.model,
         "--batch_size",
-        str(defaults["batch_size"]),
+        str(defaults.get("batch_size", 32)),
         "--query_prefix",
-        str(defaults["query_prefix"]),
+        str(defaults.get("query_prefix", "")),
         "--doc_prefix",
-        str(defaults["doc_prefix"]),
+        str(defaults.get("doc_prefix", "")),
         "--top_k",
-        str(defaults["top_k"]),
+        str(defaults.get("top_k", 10)),
         "--candidate_k",
-        str(defaults["candidate_k"]),
+        str(defaults.get("candidate_k", 100)),
         "--cache_dir",
         str(paths["cache_dir"]),
         "--reranker_batch_size",
-        str(defaults["reranker_batch_size"]),
+        str(defaults.get("reranker_batch_size", 8)),
         "--reranker_max_length",
-        str(defaults["reranker_max_length"]),
+        str(defaults.get("reranker_max_length", 512)),
         "--repoeval_dataset_path",
         str(paths["repoeval_dataset_path"]),
         "--output_file",
@@ -172,6 +172,13 @@ def _build_eval_command(config: dict[str, Any], spec: RunSpec, smoke: bool) -> l
         "--per_query_metrics_file",
         str(spec.per_query_metrics_file),
     ]
+
+    query_prompt_name = defaults.get("query_prompt_name")
+    if query_prompt_name:
+        cmd.extend(["--query_prompt_name", str(query_prompt_name)])
+    doc_prompt_name = defaults.get("doc_prompt_name")
+    if doc_prompt_name:
+        cmd.extend(["--doc_prompt_name", str(doc_prompt_name)])
 
     if defaults.get("normalize_embeddings", False):
         cmd.append("--normalize_embeddings")

@@ -143,6 +143,8 @@ def build_eval_cmd(
     append_opt(cmd, "--batch_size", merged_value(model_cfg, defaults, "batch_size", 32))
     append_opt(cmd, "--query_prefix", merged_value(model_cfg, defaults, "query_prefix", ""))
     append_opt(cmd, "--doc_prefix", merged_value(model_cfg, defaults, "doc_prefix", ""))
+    append_opt(cmd, "--query_prompt_name", merged_value(model_cfg, defaults, "query_prompt_name", None))
+    append_opt(cmd, "--doc_prompt_name", merged_value(model_cfg, defaults, "doc_prompt_name", None))
     append_opt(cmd, "--device", merged_value(model_cfg, defaults, "device", None))
     append_opt(cmd, "--reranker_model", merged_value(model_cfg, defaults, "reranker_model", None))
     append_opt(cmd, "--reranker_batch_size", merged_value(model_cfg, defaults, "reranker_batch_size", 8))

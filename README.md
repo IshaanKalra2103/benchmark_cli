@@ -6,6 +6,7 @@ Key capabilities:
 - Baseline runs for Qwen 0.6B profiles (8B profiles hidden by default).
 - Continuous checkpoint runs for `aysinghal/ide-code-retrieval-qwen3-0.6b`.
 - Main benchmark coverage: `repoeval`, `swe-bench-lite`, `coir` dataset groups.
+- Model-aware query prompting via SentenceTransformer prompt templates (`prompt_name`).
 - Slurm integration: GPU discovery, queue submission, live job status, interactive smoke checks.
 - Manual analysis mode for positive/failure cases and raw retrieval outputs.
 
@@ -62,6 +63,36 @@ Precedence for effective config values:
 3. `.env`
 4. `.env.local`
 5. Scratch auto-relocation (unless disabled)
+
+## Prompting defaults (important)
+
+Benchmark runs now use SentenceTransformer prompt templates by default:
+
+- `query_prefix`: `""`
+- `doc_prefix`: `""`
+- `query_prompt_name`: `"query"`
+- `doc_prompt_name`: `null`
+
+This means query text is encoded with the model's built-in `query` prompt template, while documents are encoded without a prompt template.
+
+These values are sourced from `models.defaults` in config (`config/defaults.json`, optionally overridden in `config/local.json`) and passed through to `eval_repo_bench_retriever.py`.
+
+If you want to reproduce older runs that used literal prefixes, set:
+
+```json
+{
+  "models": {
+    "defaults": {
+      "query_prefix": "query: ",
+      "doc_prefix": "passage: ",
+      "query_prompt_name": null,
+      "doc_prompt_name": null
+    }
+  }
+}
+```
+
+in `config/local.json`, then rerun.
 
 ## CLI usage
 
