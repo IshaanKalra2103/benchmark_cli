@@ -51,6 +51,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no_cache", action="store_true")
     parser.add_argument("--max_instances", type=int, default=None)
     parser.add_argument("--instance_regex", type=str, default=None, help="Only run instances matching regex.")
+    parser.add_argument(
+        "--instance_list_file",
+        type=str,
+        default=None,
+        help="Optional newline-delimited instance dir names to evaluate exactly.",
+    )
     parser.add_argument("--repoeval_dataset_path", type=str, default="output/repoeval/datasets/function_level_completion_2k_context_codex.test.clean.jsonl")
     parser.add_argument("--output_file", type=str, required=True, help="Summary metrics output json.")
     parser.add_argument("--results_file", type=str, required=True, help="Generation-compatible retrieval jsonl.")
@@ -323,7 +329,20 @@ def dump_jsonl(path: str, rows: list[dict[str, Any]]) -> None:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
-def get_instance_dirs(dataset_root: str, dataset: str, max_instances: int | None, instance_regex: str | None) -> list[str]:
+def get_instance_dirs(
+    dataset_root: str,
+    dataset: str,
+    max_instances: int | None,
+    instance_regex: str | None,
+    instance_list_file: str | None = None,
+) -> list[str]:
+    def has_beir_files(path: str) -> bool:
+        return (
+            os.path.isfile(os.path.join(path, "corpus.jsonl"))
+            and os.path.isfile(os.path.join(path, "queries.jsonl"))
+            and os.path.isfile(os.path.join(path, "qrels", "test.tsv"))
+        )
+
     dirs = []
     for name in os.listdir(dataset_root):
         path = os.path.join(dataset_root, name)
@@ -333,8 +352,32 @@ def get_instance_dirs(dataset_root: str, dataset: str, max_instances: int | None
             continue
         if instance_regex is not None and re.search(instance_regex, name) is None:
             continue
+        if not has_beir_files(path):
+            print(
+                f"[warn] Skipping non-instance directory '{path}' (missing corpus/queries/qrels files).",
+                flush=True,
+            )
+            continue
         dirs.append(name)
     dirs.sort()
+    if instance_list_file:
+        with open(instance_list_file, "r", encoding="utf-8") as f:
+            requested = [line.strip() for line in f if line.strip()]
+        available = set(dirs)
+        missing = [name for name in requested if name not in available]
+        if missing:
+            raise ValueError(
+                f"instance_list_file contains {len(missing)} missing/invalid instance dirs; "
+                f"examples: {missing[:5]}"
+            )
+        seen: set[str] = set()
+        ordered_unique: list[str] = []
+        for name in requested:
+            if name in seen:
+                continue
+            seen.add(name)
+            ordered_unique.append(name)
+        return ordered_unique
     if max_instances is not None:
         dirs = dirs[:max_instances]
     return dirs
@@ -409,6 +452,7 @@ def main() -> None:
         dataset=args.dataset,
         max_instances=args.max_instances,
         instance_regex=args.instance_regex,
+        instance_list_file=args.instance_list_file,
     )
     if not instance_dirs:
         raise ValueError(f"No dataset directories matched '{args.dataset}_*' under '{args.dataset_root}'.")

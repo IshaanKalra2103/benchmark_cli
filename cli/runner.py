@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import PROJECT_ROOT
-from .slurm import submit_sbatch
+from .slurm import submit_sbatch, submit_sbatch_array_wrap
 
 
 @dataclass
@@ -381,3 +381,362 @@ def run_analysis(
     proc = subprocess.run(cmd, check=False, text=True, capture_output=True)
     output = "$ " + shlex.join(cmd) + "\n\n" + (proc.stdout or "") + (proc.stderr or "")
     return proc.returncode, output
+
+
+def _list_swebench_instance_dirs(dataset_root: Path) -> list[str]:
+    dirs: list[str] = []
+    for path in dataset_root.glob("swe-bench-lite_*"):
+        if not path.is_dir():
+            continue
+        if not (path / "corpus.jsonl").exists():
+            continue
+        if not (path / "queries.jsonl").exists():
+            continue
+        if not (path / "qrels" / "test.tsv").exists():
+            continue
+        dirs.append(path.name)
+    return sorted(dirs)
+
+
+def _split_shards(items: list[str], num_shards: int) -> list[list[str]]:
+    if num_shards <= 0:
+        raise ValueError("num_shards must be > 0")
+    if not items:
+        raise ValueError("No SWE-Bench instances found to shard.")
+    if num_shards > len(items):
+        raise ValueError(f"num_shards ({num_shards}) cannot exceed instance count ({len(items)}).")
+    shards: list[list[str]] = [[] for _ in range(num_shards)]
+    for idx, item in enumerate(items):
+        shards[idx % num_shards].append(item)
+    return shards
+
+
+def _write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+
+def _write_lines(path: Path, values: list[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    body = "".join(f"{value}\n" for value in values)
+    path.write_text(body, encoding="utf-8")
+
+
+def _eval_base_command(config: dict[str, Any], model: ModelSpec, smoke: bool) -> list[str]:
+    defaults = config["models"]["defaults"]
+    paths = config["paths"]
+    script = PROJECT_ROOT / "benchmarks" / "eval_repo_bench_retriever.py"
+    cmd = [
+        "uv",
+        "run",
+        "python",
+        str(script),
+        "--dataset",
+        "swe-bench-lite",
+        "--dataset_root",
+        str(paths["dataset_root"]),
+        "--model",
+        model.model,
+        "--batch_size",
+        str(defaults.get("batch_size", 32)),
+        "--query_prefix",
+        str(defaults.get("query_prefix", "")),
+        "--doc_prefix",
+        str(defaults.get("doc_prefix", "")),
+        "--top_k",
+        str(defaults.get("top_k", 10)),
+        "--candidate_k",
+        str(defaults.get("candidate_k", 100)),
+        "--cache_dir",
+        str(paths["cache_dir"]),
+        "--reranker_batch_size",
+        str(defaults.get("reranker_batch_size", 8)),
+        "--reranker_max_length",
+        str(defaults.get("reranker_max_length", 512)),
+        "--repoeval_dataset_path",
+        str(paths["repoeval_dataset_path"]),
+    ]
+    query_prompt_name = defaults.get("query_prompt_name")
+    if query_prompt_name:
+        cmd.extend(["--query_prompt_name", str(query_prompt_name)])
+    doc_prompt_name = defaults.get("doc_prompt_name")
+    if doc_prompt_name:
+        cmd.extend(["--doc_prompt_name", str(doc_prompt_name)])
+    if defaults.get("normalize_embeddings", False):
+        cmd.append("--normalize_embeddings")
+    if defaults.get("trust_remote_code", False):
+        cmd.append("--trust_remote_code")
+    if model.reranker_model:
+        cmd.extend(["--reranker_model", model.reranker_model])
+    if smoke:
+        cmd.extend(["--max_instances", "1", "--top_k", "5", "--candidate_k", "20"])
+    return cmd
+
+
+def _build_swebench_array_wrap_command(
+    *,
+    config: dict[str, Any],
+    model: ModelSpec,
+    model_tag: str,
+    run_root: Path,
+    smoke: bool,
+) -> str:
+    token = "__SLURM_ARRAY_TASK_ID__"
+    shard_list = run_root / "swebench_dual" / "shard_lists" / model_tag / f"shard_{token}.txt"
+    shard_dir = run_root / "swebench_dual" / "shards" / model_tag / f"shard_{token}"
+    cmd = _eval_base_command(config=config, model=model, smoke=smoke)
+    cmd.extend(
+        [
+            "--instance_list_file",
+            str(shard_list),
+            "--output_file",
+            str(shard_dir / "summary.json"),
+            "--results_file",
+            str(shard_dir / "retrieval_results.jsonl"),
+            "--raw_results_file",
+            str(shard_dir / "raw_results.jsonl"),
+            "--per_query_metrics_file",
+            str(shard_dir / "per_query_metrics.jsonl"),
+        ]
+    )
+    quoted = shlex.join(cmd)
+    quoted_token = shlex.quote(token)
+    return f"cd {shlex.quote(str(PROJECT_ROOT))} && {quoted}".replace(quoted_token, "$SLURM_ARRAY_TASK_ID")
+
+
+def submit_swebench_dual_sharded_slurm(
+    *,
+    config: dict[str, Any],
+    num_shards: int,
+    base_model_profile: str,
+    finetuned_model_profile: str,
+    run_id: str | None,
+    smoke: bool,
+    slurm_gpus: int | None,
+    slurm_partition: str | None,
+    slurm_constraint: str | None,
+    slurm_nodelist: str | None,
+) -> dict[str, Any]:
+    run_id = run_id or _now_tag()
+    results_root = Path(config["paths"]["results_root"]).resolve()
+    run_root = results_root / run_id
+    run_root.mkdir(parents=True, exist_ok=True)
+
+    dataset_root = Path(config["paths"]["dataset_root"]).resolve()
+    instance_dirs = _list_swebench_instance_dirs(dataset_root=dataset_root)
+    shards = _split_shards(instance_dirs, num_shards=num_shards)
+    shard_sizes = [len(s) for s in shards]
+
+    # Persist shard-to-instance mapping once; both models consume same mapping.
+    mapping_root = run_root / "swebench_dual" / "shard_lists"
+    _write_json(
+        run_root / "swebench_dual" / "shard_mapping.json",
+        {
+            "run_id": run_id,
+            "benchmark": "swe-bench-lite",
+            "num_shards": num_shards,
+            "num_instances": len(instance_dirs),
+            "shard_sizes": shard_sizes,
+        },
+    )
+
+    for model_tag in ("base", "finetuned"):
+        for shard_id, shard_instances in enumerate(shards):
+            shard_file = mapping_root / model_tag / f"shard_{shard_id}.txt"
+            _write_lines(shard_file, shard_instances)
+
+    model_specs = {
+        "base": resolve_model_spec(config=config, model_profile_key=base_model_profile, checkpoint_step=None),
+        "finetuned": resolve_model_spec(config=config, model_profile_key=finetuned_model_profile, checkpoint_step=None),
+    }
+
+    jobs: dict[str, dict[str, Any]] = {}
+    for model_tag, model in model_specs.items():
+        wrap_command = _build_swebench_array_wrap_command(
+            config=config,
+            model=model,
+            model_tag=model_tag,
+            run_root=run_root,
+            smoke=smoke,
+        )
+        log_dir = run_root / "swebench_dual" / "logs" / model_tag
+        job_name = f"{_safe_name(run_id)}__swedual_{model_tag}"
+        if len(job_name) > 120:
+            job_name = job_name[:120]
+        job_id, output = submit_sbatch_array_wrap(
+            wrap_command=wrap_command,
+            job_name=job_name,
+            log_dir=log_dir,
+            slurm_cfg=config["slurm"],
+            array=f"0-{num_shards - 1}",
+            gpus=slurm_gpus,
+            partition=slurm_partition,
+            constraint=slurm_constraint,
+            nodelist=slurm_nodelist,
+        )
+        jobs[model_tag] = {
+            "job_id": job_id,
+            "job_name": job_name,
+            "status": "submitted" if job_id else "submit_failed",
+            "output": output,
+            "log_dir": str(log_dir),
+            "model_profile": model.key,
+            "model_name": model.name,
+            "model_id": model.model,
+            "reranker_model": model.reranker_model,
+        }
+
+    submit_manifest = {
+        "run_id": run_id,
+        "benchmark": "swe-bench-lite",
+        "mode": "dual_sharded_slurm",
+        "num_shards": num_shards,
+        "num_instances": len(instance_dirs),
+        "shard_sizes": shard_sizes,
+        "smoke": smoke,
+        "run_root": str(run_root),
+        "dataset_root": str(dataset_root),
+        "slurm_overrides": {
+            "gpus": slurm_gpus,
+            "partition": slurm_partition,
+            "constraint": slurm_constraint,
+            "nodelist": slurm_nodelist,
+        },
+        "jobs": jobs,
+        "paths": {
+            "shard_mapping": str(run_root / "swebench_dual" / "shard_mapping.json"),
+            "submit_manifest": str(run_root / "swebench_dual" / "manifest.submit.json"),
+        },
+    }
+    _write_json(run_root / "swebench_dual" / "manifest.submit.json", submit_manifest)
+    return submit_manifest
+
+
+def _read_jsonl(path: Path) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            text = line.strip()
+            if not text:
+                continue
+            rows.append(json.loads(text))
+    return rows
+
+
+def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def _merge_summary_files(summary_files: list[Path]) -> dict[str, Any]:
+    summaries: list[dict[str, Any]] = [json.loads(path.read_text(encoding="utf-8")) for path in summary_files]
+    if not summaries:
+        raise ValueError("No shard summaries found to merge.")
+
+    total_queries = sum(int(s.get("num_queries", 0)) for s in summaries)
+    merged: dict[str, Any] = {}
+    for metric_name in ("ndcg", "mrr", "recall", "precision"):
+        metric_keys: set[str] = set()
+        for summary in summaries:
+            metric_keys.update((summary.get(metric_name) or {}).keys())
+        merged_metric: dict[str, float] = {}
+        for key in sorted(metric_keys):
+            numerator = 0.0
+            for summary in summaries:
+                weight = float(summary.get("num_queries", 0))
+                numerator += weight * float((summary.get(metric_name) or {}).get(key, 0.0))
+            merged_metric[key] = (numerator / total_queries) if total_queries > 0 else 0.0
+        merged[metric_name] = merged_metric
+
+    merged["time"] = sum(float(s.get("time", 0.0)) for s in summaries)
+    merged["num_queries"] = total_queries
+    merged["num_instances"] = sum(int(s.get("num_instances", 0)) for s in summaries)
+    merged["model"] = summaries[0].get("model")
+    merged["reranker_model"] = summaries[0].get("reranker_model")
+
+    per_instance: dict[str, Any] = {}
+    for summary in summaries:
+        for instance, metrics in (summary.get("per_instance") or {}).items():
+            per_instance[instance] = metrics
+    merged["per_instance"] = per_instance
+    merged["num_shards_merged"] = len(summaries)
+    return merged
+
+
+def merge_swebench_dual_sharded_outputs(
+    *,
+    config: dict[str, Any],
+    run_id: str,
+) -> dict[str, Any]:
+    results_root = Path(config["paths"]["results_root"]).resolve()
+    run_root = results_root / run_id
+    submit_manifest_path = run_root / "swebench_dual" / "manifest.submit.json"
+    if not submit_manifest_path.exists():
+        raise ValueError(f"Submit manifest not found: {submit_manifest_path}")
+
+    submit_manifest = json.loads(submit_manifest_path.read_text(encoding="utf-8"))
+    num_shards = int(submit_manifest["num_shards"])
+    models = ("base", "finetuned")
+
+    model_outputs: dict[str, dict[str, Any]] = {}
+    for model_tag in models:
+        shard_root = run_root / "swebench_dual" / "shards" / model_tag
+        summary_files: list[Path] = []
+        merged_retrieval: list[dict[str, Any]] = []
+        merged_raw: list[dict[str, Any]] = []
+        merged_per_query: list[dict[str, Any]] = []
+        have_per_query = True
+
+        for shard_id in range(num_shards):
+            shard_dir = shard_root / f"shard_{shard_id}"
+            summary_file = shard_dir / "summary.json"
+            retrieval_file = shard_dir / "retrieval_results.jsonl"
+            raw_file = shard_dir / "raw_results.jsonl"
+            per_query_file = shard_dir / "per_query_metrics.jsonl"
+            for required in (summary_file, retrieval_file, raw_file):
+                if not required.exists():
+                    raise ValueError(f"Missing shard artifact: {required}")
+            summary_files.append(summary_file)
+            merged_retrieval.extend(_read_jsonl(retrieval_file))
+            merged_raw.extend(_read_jsonl(raw_file))
+            if have_per_query and per_query_file.exists():
+                merged_per_query.extend(_read_jsonl(per_query_file))
+            else:
+                have_per_query = False
+
+        final_dir = run_root / "swebench_dual" / "final" / model_tag
+        final_summary = final_dir / "summary.json"
+        final_retrieval = final_dir / "retrieval_results.jsonl"
+        final_raw = final_dir / "raw_results.jsonl"
+        final_per_query = final_dir / "per_query_metrics.jsonl"
+
+        _write_json(final_summary, _merge_summary_files(summary_files))
+        _write_jsonl(final_retrieval, merged_retrieval)
+        _write_jsonl(final_raw, merged_raw)
+        if have_per_query:
+            _write_jsonl(final_per_query, merged_per_query)
+
+        model_outputs[model_tag] = {
+            "final_dir": str(final_dir),
+            "summary_file": str(final_summary),
+            "retrieval_results_file": str(final_retrieval),
+            "raw_results_file": str(final_raw),
+            "per_query_metrics_file": str(final_per_query) if have_per_query else None,
+            "num_retrieval_rows": len(merged_retrieval),
+            "num_raw_rows": len(merged_raw),
+            "num_per_query_rows": len(merged_per_query) if have_per_query else None,
+        }
+
+    final_manifest = {
+        "run_id": run_id,
+        "benchmark": "swe-bench-lite",
+        "mode": "dual_sharded_slurm",
+        "submit_manifest": str(submit_manifest_path),
+        "final_outputs": model_outputs,
+    }
+    final_manifest_path = run_root / "swebench_dual" / "manifest.final.json"
+    _write_json(final_manifest_path, final_manifest)
+    final_manifest["final_manifest"] = str(final_manifest_path)
+    return final_manifest

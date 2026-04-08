@@ -11,7 +11,13 @@ from typing import Any
 from .checkpoints import list_hf_checkpoints
 from .config import USER_CONFIG_PATH, load_config, write_default_config
 from .datasets import run_dataset_download, submit_dataset_download_slurm
-from .runner import execute_runs, preview_commands, run_analysis
+from .runner import (
+    execute_runs,
+    merge_swebench_dual_sharded_outputs,
+    preview_commands,
+    run_analysis,
+    submit_swebench_dual_sharded_slurm,
+)
 from .slurm import launch_interactive_srun, list_gpu_nodes, list_jobs
 
 
@@ -179,6 +185,36 @@ def _cmd_dataset_download(args: argparse.Namespace) -> int:
     return code
 
 
+def _cmd_swebench_dual_submit(args: argparse.Namespace) -> int:
+    cfg = load_config()
+    payload = submit_swebench_dual_sharded_slurm(
+        config=cfg,
+        num_shards=args.num_shards,
+        base_model_profile=args.base_model_profile,
+        finetuned_model_profile=args.finetuned_model_profile,
+        run_id=args.run_id,
+        smoke=args.smoke,
+        slurm_gpus=args.slurm_gpus,
+        slurm_partition=args.slurm_partition,
+        slurm_constraint=args.slurm_constraint,
+        slurm_nodelist=args.slurm_nodelist,
+    )
+    _print_json(payload)
+    all_ok = True
+    for model_tag in ("base", "finetuned"):
+        status = payload.get("jobs", {}).get(model_tag, {}).get("status")
+        if status != "submitted":
+            all_ok = False
+    return 0 if all_ok else 1
+
+
+def _cmd_swebench_dual_merge(args: argparse.Namespace) -> int:
+    cfg = load_config()
+    payload = merge_swebench_dual_sharded_outputs(config=cfg, run_id=args.run_id)
+    _print_json(payload)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Benchmark CLI for retrieval evaluation and Slurm orchestration.")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -244,6 +280,31 @@ def build_parser() -> argparse.ArgumentParser:
     dataset_download.add_argument("--slurm-constraint", default=None, help="Override Slurm constraint.")
     dataset_download.add_argument("--slurm-nodelist", default=None, help="Override Slurm nodelist.")
     dataset_download.set_defaults(func=_cmd_dataset_download)
+
+    swebench = sub.add_parser("swebench", help="SWE-Bench specific orchestration commands.")
+    swebench_sub = swebench.add_subparsers(dest="swebench_action", required=True)
+    swebench_dual = swebench_sub.add_parser("dual", help="Dual-model (base + finetuned) sharded workflow.")
+    swebench_dual_sub = swebench_dual.add_subparsers(dest="swebench_dual_action", required=True)
+
+    swebench_dual_submit = swebench_dual_sub.add_parser("submit", help="Submit sharded Slurm arrays for base and finetuned models.")
+    swebench_dual_submit.add_argument("--num-shards", type=int, required=True, help="Total number of shards/jobs per model.")
+    swebench_dual_submit.add_argument("--run-id", default=None, help="Optional explicit run id.")
+    swebench_dual_submit.add_argument("--base-model-profile", default="qwen3_embed_0_6b", help="Base model profile key.")
+    swebench_dual_submit.add_argument(
+        "--finetuned-model-profile",
+        default="qwen3_embed_0_6b_finetuned_latest",
+        help="Finetuned model profile key.",
+    )
+    swebench_dual_submit.add_argument("--smoke", action="store_true", help="Run with tiny settings for quick validation.")
+    swebench_dual_submit.add_argument("--slurm-gpus", type=int, default=None, help="Override GPU count for Slurm jobs.")
+    swebench_dual_submit.add_argument("--slurm-partition", default=None, help="Override Slurm partition.")
+    swebench_dual_submit.add_argument("--slurm-constraint", default=None, help="Override Slurm constraint.")
+    swebench_dual_submit.add_argument("--slurm-nodelist", default=None, help="Override Slurm nodelist.")
+    swebench_dual_submit.set_defaults(func=_cmd_swebench_dual_submit)
+
+    swebench_dual_merge = swebench_dual_sub.add_parser("merge", help="Merge completed shard outputs into final files.")
+    swebench_dual_merge.add_argument("--run-id", required=True, help="Run id created by swebench dual submit.")
+    swebench_dual_merge.set_defaults(func=_cmd_swebench_dual_merge)
 
     return parser
 

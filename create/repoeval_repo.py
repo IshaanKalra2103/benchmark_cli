@@ -226,6 +226,7 @@ def repo2code(
 
 def main():
     download_data(args.data_cache_dir)
+    os.makedirs(args.results_dir, exist_ok=True)
 
     REPOs = REPOs_function if args.split == "function" else REPOs_line_and_api
     if args.num_shards > 1:

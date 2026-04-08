@@ -4,6 +4,8 @@ import datetime as dt
 import json
 import os
 import re
+import shutil
+import subprocess
 from copy import deepcopy
 from pathlib import Path
 
@@ -104,6 +106,10 @@ class BenchmarkTuiApp(App[None]):
         self.cfg = load_config()
         self._warned_no_squeue = False
         self._todo_manifest_details: dict[str, str] = {}
+        self._recent_finished_hidden_job_ids: set[str] = set()
+        self._last_recent_finished_job_ids: set[str] = set()
+        self._jsonl_line_cache: dict[str, tuple[int, int, int]] = {}
+        self._swebench_total_instances_cache: int | None = None
 
     def compose(self) -> ComposeResult:
         profiles = visible_model_profiles(self.cfg)
@@ -170,6 +176,7 @@ class BenchmarkTuiApp(App[None]):
                 with Vertical(id="slurm_status"):
                     yield Label("Queued sbatch Jobs")
                     yield Button("Refresh Queue", id="refresh_slurm")
+                    yield Button("Clear Recently Finished", id="clear_recent_finished")
                     yield DataTable(id="jobs_table")
                     yield Static("Running tails: pending refresh...", id="jobs_progress")
             with TabPane("GPU Availability", id="gpu_tab"):
@@ -215,7 +222,7 @@ class BenchmarkTuiApp(App[None]):
 
     def on_mount(self) -> None:
         jobs_table = self.query_one("#jobs_table", DataTable)
-        jobs_table.add_columns("job_id", "benchmark", "name", "state", "runtime", "nodes", "reason", "progress")
+        jobs_table.add_columns("job_id", "benchmark", "name", "state", "runtime", "nodes", "gpu", "reason", "progress")
         todo_table = self.query_one("#todo_table", DataTable)
         todo_table.add_columns("benchmark", "dataset", "model", "status", "detail")
         free_gpu_table = self.query_one("#free_gpu_table", DataTable)
@@ -234,6 +241,28 @@ class BenchmarkTuiApp(App[None]):
     def _common_log(self, message: str) -> None:
         stamp = dt.datetime.now().strftime("%H:%M:%S")
         self.query_one("#common_log", RichLog).write(f"[{stamp}] {message}")
+
+    def _capture_table_state(self, table: DataTable) -> dict[str, int]:
+        return {
+            "scroll_x": int(getattr(table, "scroll_x", 0)),
+            "scroll_y": int(getattr(table, "scroll_y", 0)),
+            "cursor_row": int(getattr(table, "cursor_row", 0)),
+            "cursor_column": int(getattr(table, "cursor_column", 0)),
+        }
+
+    def _restore_table_state(self, table: DataTable, state: dict[str, int]) -> None:
+        try:
+            if table.row_count > 0:
+                row = max(0, min(state.get("cursor_row", 0), table.row_count - 1))
+                col = max(0, state.get("cursor_column", 0))
+                table.move_cursor(row=row, column=col, animate=False)
+            table.scroll_to(
+                x=max(0, state.get("scroll_x", 0)),
+                y=max(0, state.get("scroll_y", 0)),
+                animate=False,
+            )
+        except Exception:  # noqa: BLE001
+            pass
 
     def _common_dataset_options(self) -> list[tuple[str, str]]:
         opts: list[tuple[str, str]] = [("repoeval", "repoeval"), ("swe-bench-lite", "swe-bench-lite")]
@@ -438,6 +467,10 @@ class BenchmarkTuiApp(App[None]):
 
     @work(thread=True)
     def refresh_slurm_async(self) -> None:
+        try:
+            self._refresh_config_from_env()
+        except Exception:  # noqa: BLE001
+            pass
         self.refresh_jobs_async()
         self.refresh_todo_async()
         self.refresh_full_free_gpus_async()
@@ -455,63 +488,121 @@ class BenchmarkTuiApp(App[None]):
 
     @work(thread=True)
     def refresh_jobs_async(self) -> None:
-        table = self.query_one("#jobs_table", DataTable)
-        progress_panel = self.query_one("#jobs_progress", Static)
-        user = os.environ.get("USER", "")
-        jobs = list_jobs(user=user)
-        jobs = [job for job in jobs if job.state.upper() not in {"COMPLETED", "FAILED", "CANCELLED", "TIMEOUT"}]
-        tools = slurm_tool_status()
-        progress_map: dict[str, str] = {}
-        tails: list[str] = []
+        try:
+            user = os.environ.get("USER", "")
+            jobs = list_jobs(user=user)
+            jobs = [job for job in jobs if job.state.upper() not in {"COMPLETED", "FAILED", "CANCELLED", "TIMEOUT"}]
+            tools = slurm_tool_status()
+            progress_map: dict[str, str] = {}
+            tails: list[str] = []
+            swebench_group_totals: dict[str, tuple[int, int]] = {}
+            active_job_ids = {job.job_id for job in jobs}
+            node_gpu: dict[str, str] = {}
+            try:
+                for node in list_gpu_nodes():
+                    if node.node:
+                        node_gpu[node.node] = node.gpu_model or "-"
+            except Exception:  # noqa: BLE001
+                node_gpu = {}
 
-        for job in jobs:
-            if job.state.upper() != "RUNNING":
-                continue
-            progress, tail = self._job_log_progress(job.job_id)
-            if progress:
-                progress_map[job.job_id] = progress
-            else:
-                progress_map[job.job_id] = "-"
-            if tail:
-                tails.append(f"{job.job_id} {job.name}: {tail}")
-            else:
-                tails.append(f"{job.job_id} {job.name}: (no log tail yet)")
-
-        def update() -> None:
-            table.clear()
             for job in jobs:
-                table.add_row(
-                    job.job_id,
-                    self._benchmark_from_job_name(job.name),
-                    job.name,
-                    job.state,
-                    job.runtime,
-                    job.nodes,
-                    job.reason,
-                    progress_map.get(job.job_id, "-"),
-                )
-            progress_text = "Running tails:\n"
-            if tails:
-                progress_text += "\n".join(f"- {line}" for line in tails[:12])
-            else:
-                progress_text += "- no running jobs"
-            progress_panel.update(progress_text)
-            pending_reqnode = sum(
-                1
-                for job in jobs
-                if job.state.upper() == "PENDING" and "ReqNodeNotAvail" in (job.reason or "")
-            )
-            if pending_reqnode:
-                self._log(
-                    f"{pending_reqnode} job(s) pending due to node pinning (ReqNodeNotAvail). Consider relaxing nodelist/constraint."
-                )
-            if jobs:
-                self._warned_no_squeue = False
-            if not jobs and not tools["squeue"] and not self._warned_no_squeue:
-                self._log("No Slurm queue info: `squeue` is not available in this environment.")
-                self._warned_no_squeue = True
+                if job.state.upper() != "RUNNING":
+                    continue
+                try:
+                    progress, tail = self._job_log_progress(job.job_id)
+                    inst_progress = self._job_instance_progress(job)
+                    if self._dataset_from_job_name(job.name) == "swe-bench-lite" and inst_progress.startswith("inst "):
+                        m = re.match(r"inst\s+(\d+)/(\d+|\?)", inst_progress)
+                        if m:
+                            done_i = int(m.group(1))
+                            total_token = m.group(2)
+                            total_i = int(total_token) if total_token.isdigit() else 0
+                            group_key = re.sub(r"_shard\d+_", "_shard*_", job.name)
+                            prev_done, prev_total = swebench_group_totals.get(group_key, (0, 0))
+                            swebench_group_totals[group_key] = (prev_done + done_i, prev_total + total_i)
+                    if progress:
+                        progress_map[job.job_id] = f"{inst_progress} | {progress}" if inst_progress != "-" else progress
+                    else:
+                        progress_map[job.job_id] = inst_progress if inst_progress != "-" else "-"
+                    if tail:
+                        prefix = f"[{inst_progress}] " if inst_progress != "-" else ""
+                        tails.append(f"{job.job_id} {job.name}: {prefix}{tail}")
+                    else:
+                        tails.append(f"{job.job_id} {job.name}: (no log tail yet)")
+                except Exception as exc:  # noqa: BLE001
+                    progress_map[job.job_id] = "-"
+                    tails.append(f"{job.job_id} {job.name}: progress parse failed ({exc})")
 
-        self.call_from_thread(update)
+            recent_finished_entries = self._recent_finished_benchmark_jobs(user=user, active_job_ids=active_job_ids)
+            self._last_recent_finished_job_ids = {job_id for job_id, _ in recent_finished_entries}
+            recent_finished = [line for _, line in recent_finished_entries]
+
+            def update() -> None:
+                try:
+                    table = self.query_one("#jobs_table", DataTable)
+                    progress_panel = self.query_one("#jobs_progress", Static)
+                    table_state = self._capture_table_state(table)
+                    table.clear()
+                    for job in jobs:
+                        job_gpu = "-"
+                        reason_or_node = (job.reason or "").strip()
+                        # In RUNNING state, Slurm %R commonly returns allocated node name.
+                        if reason_or_node in node_gpu:
+                            job_gpu = node_gpu[reason_or_node]
+                        elif "," not in reason_or_node and reason_or_node.startswith(("cml", "tron", "gamma", "clip", "vulcan", "legacy", "cbcb", "csd")):
+                            job_gpu = node_gpu.get(reason_or_node, "-")
+                        table.add_row(
+                            job.job_id,
+                            self._benchmark_from_job_name(job.name),
+                            job.name,
+                            job.state,
+                            job.runtime,
+                            job.nodes,
+                            job_gpu,
+                            job.reason,
+                            progress_map.get(job.job_id, "-"),
+                        )
+                    self._restore_table_state(table, table_state)
+
+                    progress_text = "Running tails:\n"
+                    if tails:
+                        progress_text += "\n".join(f"- {line}" for line in tails[:12])
+                    else:
+                        progress_text += "- no running jobs"
+                    if swebench_group_totals:
+                        progress_text += "\n\nSWE-Bench aggregate:\n"
+                        for key, (done_total, full_total) in list(swebench_group_totals.items())[:8]:
+                            if full_total > 0:
+                                progress_text += f"- {key}: inst {done_total}/{full_total}\n"
+                            else:
+                                progress_text += f"- {key}: inst {done_total}/?\n"
+                    progress_text += "\n\nRecently finished:\n"
+                    if recent_finished:
+                        progress_text += "\n".join(f"- {line}" for line in recent_finished[:12])
+                    else:
+                        progress_text += "- no recent terminal benchmark jobs"
+                    progress_panel.update(progress_text)
+
+                    pending_reqnode = sum(
+                        1
+                        for job in jobs
+                        if job.state.upper() == "PENDING" and "ReqNodeNotAvail" in (job.reason or "")
+                    )
+                    if pending_reqnode:
+                        self._log(
+                            f"{pending_reqnode} job(s) pending due to node pinning (ReqNodeNotAvail). Consider relaxing nodelist/constraint."
+                        )
+                    if jobs:
+                        self._warned_no_squeue = False
+                    if not jobs and not tools["squeue"] and not self._warned_no_squeue:
+                        self._log("No Slurm queue info: `squeue` is not available in this environment.")
+                        self._warned_no_squeue = True
+                except Exception as exc:  # noqa: BLE001
+                    self._log(f"Slurm table update failed: {exc}")
+
+            self.call_from_thread(update)
+        except Exception as exc:  # noqa: BLE001
+            self.call_from_thread(self._log, f"Slurm refresh failed: {exc}")
 
     @work(thread=True)
     def refresh_full_free_gpus_async(self) -> None:
@@ -546,6 +637,8 @@ class BenchmarkTuiApp(App[None]):
         )
 
         def update() -> None:
+            free_state = self._capture_table_state(table)
+            partial_state = self._capture_table_state(partial_table)
             table.clear()
             for node in free_nodes:
                 table.add_row(
@@ -564,11 +657,16 @@ class BenchmarkTuiApp(App[None]):
                     f"{node.available_gpus}/{node.total_gpus}",
                     node.state,
                 )
+            self._restore_table_state(table, free_state)
+            self._restore_table_state(partial_table, partial_state)
             self._log(f"GPU availability refreshed: free={len(free_nodes)}, partial={len(partial_nodes)}")
 
         self.call_from_thread(update)
 
     def _dataset_from_job_name(self, name: str) -> str:
+        if name.startswith("dataset_"):
+            # e.g. dataset_swe-bench-lite or dataset_repoeval
+            return name[len("dataset_"):]
         marker = "__bench_"
         core = name
         if marker in name:
@@ -602,6 +700,8 @@ class BenchmarkTuiApp(App[None]):
 
     def _benchmark_from_job_name(self, name: str) -> str:
         dataset = self._dataset_from_job_name(name)
+        if name.startswith("dataset_"):
+            return f"dataset/{dataset}"
         if dataset == "repoeval":
             return "repoeval"
         if dataset == "swe-bench-lite":
@@ -615,9 +715,17 @@ class BenchmarkTuiApp(App[None]):
         datasets: list[tuple[str, str]] = [("repoeval", "repoeval"), ("swe-bench-lite", "swe-bench-lite")]
         for ds in sum(self.cfg["benchmarks"]["coir"]["groups"].values(), []):
             datasets.append((f"coir/{ds}", ds))
+        # Some COIR datasets can appear in multiple groups; keep first occurrence only.
+        deduped_datasets: list[tuple[str, str]] = []
+        seen_datasets: set[tuple[str, str]] = set()
+        for item in datasets:
+            if item in seen_datasets:
+                continue
+            seen_datasets.add(item)
+            deduped_datasets.append(item)
         models = [("base", "qwen3-embed-0.6b"), ("finetuned-latest", "qwen3-embed-0.6b-finetuned-latest")]
         targets: list[tuple[str, str, str]] = []
-        for bench, ds in datasets:
+        for bench, ds in deduped_datasets:
             for model_tag, _ in models:
                 targets.append((bench, ds, model_tag))
         return targets
@@ -653,6 +761,59 @@ class BenchmarkTuiApp(App[None]):
             return None
         candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
         return candidates[0]
+
+    def _failed_reason_for_run_dir(self, run_dir: Path) -> str:
+        for pattern in ("*.err", "*.out", "run.log"):
+            files = sorted(run_dir.glob(pattern), key=lambda p: p.stat().st_mtime, reverse=True)
+            for path in files:
+                try:
+                    text = self._tail_text(path)
+                except Exception:  # noqa: BLE001
+                    continue
+                lines = [line.strip() for line in re.split(r"[\r\n]+", text) if line.strip()]
+                if not lines:
+                    continue
+                for line in reversed(lines):
+                    if any(
+                        token in line.lower()
+                        for token in (
+                            "traceback",
+                            "error",
+                            "exception",
+                            "oom",
+                            "out of memory",
+                            "time limit",
+                            "cancelled",
+                            "fileexistserror",
+                        )
+                    ):
+                        return line[-180:]
+                return lines[-1][-180:]
+        return "-"
+
+    def _find_latest_failed_attempt(self, dataset: str, model_tag: str) -> tuple[Path, str] | None:
+        run_name = "qwen3-embed-0.6b" if model_tag == "base" else "qwen3-embed-0.6b-finetuned-latest"
+        candidates: list[tuple[float, Path, str]] = []
+        for root in self._candidate_results_roots():
+            if not root.exists():
+                continue
+            pattern = f"**/{dataset}/{run_name}/run.log"
+            for run_log in root.glob(pattern):
+                run_dir = run_log.parent
+                summary_path = run_dir / "summary.json"
+                try:
+                    if summary_path.exists() and self._summary_is_complete(summary_path):
+                        continue
+                    reason = self._failed_reason_for_run_dir(run_dir)
+                    mtime = run_log.stat().st_mtime
+                    candidates.append((mtime, run_dir, reason))
+                except Exception:  # noqa: BLE001
+                    continue
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        _, run_dir, reason = candidates[0]
+        return run_dir, reason
 
     def _manifest_details_for_target(self, dataset: str, model_tag: str) -> str:
         summary_path = self._find_latest_completed_summary(dataset, model_tag)
@@ -742,7 +903,7 @@ class BenchmarkTuiApp(App[None]):
         targets = self._todo_targets()
         rows: list[tuple[str, str, str, str, str]] = []
         manifest_by_key: dict[str, str] = {}
-        left = running = completed = 0
+        left = running = completed = failed = 0
         for bench, dataset, model_tag in targets:
             key = (dataset, model_tag)
             row_key = f"{bench}|{dataset}|{model_tag}"
@@ -756,45 +917,84 @@ class BenchmarkTuiApp(App[None]):
                 manifest_by_key[row_key] = self._manifest_details_for_target(dataset, model_tag)
                 completed += 1
             else:
-                st = "left"
-                detail = "-"
-                left += 1
+                failed_info = self._find_latest_failed_attempt(dataset, model_tag)
+                if failed_info is not None:
+                    st = "failed"
+                    detail = failed_info[1] if failed_info[1] and failed_info[1] != "-" else "run.log present without valid summary"
+                    failed += 1
+                else:
+                    st = "left"
+                    detail = "-"
+                    left += 1
             rows.append((bench, dataset, model_tag, st, detail, row_key))
 
         def update() -> None:
+            table_state = self._capture_table_state(table)
             table.clear()
             self._todo_manifest_details = manifest_by_key
             for row in rows:
                 bench, dataset, model_tag, st, detail, row_key = row
                 table.add_row(bench, dataset, model_tag, st, detail, key=row_key)
+            self._restore_table_state(table, table_state)
             cleanup_note = f", cleaned_empty_summary={removed}" if removed else ""
             summary.update(
-                f"Todo summary: left={left}, running/queued={running}, completed={completed}{cleanup_note}"
+                f"Todo summary: left={left}, running/queued={running}, completed={completed}, failed={failed}{cleanup_note}"
             )
             manifest_panel.update("Manifest details: select a completed row to view run manifest metadata.")
 
         self.call_from_thread(update)
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
-        if event.data_table.id != "todo_table":
+        table_id = event.data_table.id
+        if table_id == "todo_table":
+            panel = self.query_one("#todo_manifest", Static)
+            row_key = str(event.row_key.value)
+            details = self._todo_manifest_details.get(row_key)
+            if details:
+                panel.update(details)
+            else:
+                panel.update("Manifest details: selected row is not completed or no manifest is available.")
             return
-        panel = self.query_one("#todo_manifest", Static)
-        row_key = str(event.row_key.value)
-        details = self._todo_manifest_details.get(row_key)
-        if details:
-            panel.update(details)
-        else:
-            panel.update("Manifest details: selected row is not completed or no manifest is available.")
+
+        if table_id not in {"free_gpu_table", "partial_gpu_table"}:
+            return
+
+        # GPU availability rows are clickable and auto-fill Slurm fields.
+        row = event.data_table.get_row(event.row_key)
+        node = str(row[0]).strip()
+        partition_raw = str(row[1]).strip()
+        gpus_raw = str(row[3]).strip()
+
+        available_gpus = 1
+        try:
+            if "/" in gpus_raw:
+                available_gpus = int(gpus_raw.split("/", 1)[0].strip())
+            else:
+                available_gpus = int(gpus_raw)
+        except ValueError:
+            available_gpus = 1
+        available_gpus = max(1, available_gpus)
+
+        partition_tokens = [p.strip() for p in partition_raw.split(",") if p.strip()]
+        selected_partition = partition_tokens[0] if partition_tokens else ""
+        if "scavenger" in partition_tokens:
+            selected_partition = "scavenger"
+
+        self.query_one("#slurm_nodelist", Input).value = node
+        self.query_one("#slurm_partition", Input).value = selected_partition
+        self.query_one("#slurm_gpus", Input).value = str(available_gpus)
+        self._log(
+            f"Selected GPU node={node} (table={table_id}): partition={selected_partition}, gpus={available_gpus}, nodelist={node}."
+        )
 
     def _candidate_results_roots(self) -> list[Path]:
         roots: list[Path] = []
         configured = Path(str(self.cfg["paths"]["results_root"])).expanduser()
         roots.append(configured)
 
-        user = os.environ.get("USER", "").strip()
-        if user:
-            scratch = Path(f"/fs/cml-scratch/{user}/benchmark_cli/benchmark_cli/results")
-            roots.append(scratch)
+        scratch_workspace = os.environ.get("BENCHMARK_SCRATCH_WORKSPACE", "").strip()
+        if scratch_workspace:
+            roots.append(Path(scratch_workspace).expanduser() / "benchmark_cli" / "results")
 
         dedup: list[Path] = []
         seen: set[str] = set()
@@ -810,11 +1010,17 @@ class BenchmarkTuiApp(App[None]):
         for root in self._candidate_results_roots():
             if not root.exists():
                 continue
+            # Non-array sbatch logs: <job_name>-<job_id>.err
+            # Array sbatch logs: <job_name>_<array_job_id>_<task_id>.err
             err_matches = list(root.glob(f"**/*-{job_id}.err"))
+            err_matches.extend(root.glob(f"**/*_{job_id}.err"))
+            err_matches.extend(root.glob(f"**/*_{job_id}_*.err"))
             if err_matches:
                 err_matches.sort(key=lambda p: p.stat().st_mtime, reverse=True)
                 return err_matches[0]
             out_matches = list(root.glob(f"**/*-{job_id}.out"))
+            out_matches.extend(root.glob(f"**/*_{job_id}.out"))
+            out_matches.extend(root.glob(f"**/*_{job_id}_*.out"))
             if out_matches:
                 out_matches.sort(key=lambda p: p.stat().st_mtime, reverse=True)
                 return out_matches[0]
@@ -852,6 +1058,164 @@ class BenchmarkTuiApp(App[None]):
         if len(tail_line) > 180:
             tail_line = tail_line[-180:]
         return progress_line, tail_line
+
+    def _count_jsonl_lines_cached(self, path: Path) -> int:
+        try:
+            st = path.stat()
+        except OSError:
+            return 0
+        key = str(path)
+        stamp = (int(st.st_size), int(st.st_mtime_ns))
+        cached = self._jsonl_line_cache.get(key)
+        if cached and (cached[0], cached[1]) == stamp:
+            return cached[2]
+        lines = 0
+        try:
+            with path.open("r", encoding="utf-8", errors="ignore") as f:
+                for lines, _ in enumerate(f, start=1):
+                    pass
+        except OSError:
+            lines = 0
+        self._jsonl_line_cache[key] = (stamp[0], stamp[1], lines)
+        return lines
+
+    def _swebench_total_instances(self) -> int:
+        if self._swebench_total_instances_cache is not None:
+            return self._swebench_total_instances_cache
+        total = 0
+        dataset_root = str(self.cfg["paths"]["dataset_root"])
+        try:
+            for name in os.listdir(dataset_root):
+                path = os.path.join(dataset_root, name)
+                if not os.path.isdir(path):
+                    continue
+                if not name.startswith("swe-bench-lite_"):
+                    continue
+                if (
+                    os.path.isfile(os.path.join(path, "corpus.jsonl"))
+                    and os.path.isfile(os.path.join(path, "queries.jsonl"))
+                    and os.path.isfile(os.path.join(path, "qrels", "test.tsv"))
+                ):
+                    total += 1
+        except OSError:
+            total = 0
+        self._swebench_total_instances_cache = total
+        return total
+
+    def _extract_instance_total_from_script(self, run_dir: Path) -> int | None:
+        scripts = sorted(run_dir.glob("*.sbatch.sh"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if not scripts:
+            return None
+        try:
+            text = scripts[0].read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            return None
+        match = re.search(r"--instance_regex\s+([^\n]+?)(?:\s+--|$)", text)
+        if not match:
+            return None
+        token = match.group(1).strip()
+        if token and token[0] == token[-1] and token[0] in {"'", '"'}:
+            token = token[1:-1]
+        if token.startswith("^(") and token.endswith(")$"):
+            body = token[2:-2]
+            if not body:
+                return 0
+            return body.count("|") + 1
+        return None
+
+    def _job_instance_progress(self, job: object) -> str:
+        if self._dataset_from_job_name(job.name) != "swe-bench-lite":
+            return "-"
+        log_path = self._find_job_log(job.job_id)
+        if log_path is None:
+            return "-"
+        run_dir = log_path.parent
+        done = self._count_jsonl_lines_cached(run_dir / "raw_results.jsonl")
+        total = self._extract_instance_total_from_script(run_dir)
+        if total is None:
+            total = self._swebench_total_instances()
+        if total <= 0:
+            return f"inst {done}/?"
+        return f"inst {min(done, total)}/{total}"
+
+    def _job_failure_reason(self, job_id: str) -> str:
+        log_path = self._find_job_log(job_id)
+        if log_path is None:
+            return "-"
+        try:
+            text = self._tail_text(log_path)
+        except Exception:  # noqa: BLE001
+            return "-"
+        lines = [line.strip() for line in re.split(r"[\r\n]+", text) if line.strip()]
+        if not lines:
+            return "-"
+        patterns = (
+            r"DUE TO TIME LIMIT",
+            r"CUDA out of memory",
+            r"OutOfMemoryError",
+            r"OOM",
+            r"Traceback",
+            r"FileExistsError",
+            r"Exception",
+            r"Error",
+        )
+        for line in reversed(lines):
+            if any(re.search(pat, line, flags=re.IGNORECASE) for pat in patterns):
+                return line[-180:]
+        return lines[-1][-180:]
+
+    def _recent_finished_benchmark_jobs(self, user: str, active_job_ids: set[str]) -> list[tuple[str, str]]:
+        if not shutil.which("sacct"):
+            return []
+        # Keep this lightweight: only recent records and only benchmark job names.
+        cmd = [
+            "sacct",
+            "-u",
+            user,
+            "-S",
+            "now-24hours",
+            "--format=JobIDRaw,JobName%140,State,Elapsed,ExitCode,End",
+            "-n",
+            "-P",
+        ]
+        try:
+            proc = subprocess.run(cmd, check=False, text=True, capture_output=True)
+        except Exception:  # noqa: BLE001
+            return []
+        if proc.returncode != 0 or not proc.stdout.strip():
+            return []
+
+        terminal_prefixes = ("COMPLETED", "FAILED", "CANCELLED", "TIMEOUT", "OUT_OF_MEMORY")
+        lines: list[tuple[str, str, str]] = []
+        seen: set[str] = set()
+        current_terminal_ids: set[str] = set()
+        for row in proc.stdout.splitlines():
+            fields = row.split("|")
+            if len(fields) < 6:
+                continue
+            job_id, name, state, elapsed, exit_code, end = (f.strip() for f in fields[:6])
+            if not job_id or not name or "." in job_id:
+                continue
+            if job_id in active_job_ids or job_id in seen:
+                continue
+            if "__bench_" not in name and not name.startswith("bench_") and not name.startswith("dataset_"):
+                continue
+            state_up = state.upper()
+            if not any(state_up.startswith(prefix) for prefix in terminal_prefixes):
+                continue
+            current_terminal_ids.add(job_id)
+            seen.add(job_id)
+            if job_id in self._recent_finished_hidden_job_ids:
+                continue
+            if state_up.startswith("COMPLETED"):
+                lines.append((end, job_id, f"{job_id} {name}: SUCCESS ({elapsed}, exit={exit_code})"))
+            else:
+                reason = self._job_failure_reason(job_id)
+                lines.append((end, job_id, f"{job_id} {name}: FAILED ({state}, exit={exit_code}) reason={reason}"))
+        # Keep hidden IDs bounded to the currently queried history window.
+        self._recent_finished_hidden_job_ids.intersection_update(current_terminal_ids)
+        lines.sort(key=lambda x: x[0], reverse=True)
+        return [(job_id, line) for _, job_id, line in lines]
 
     @work(thread=True)
     def queue_run_async(self, use_slurm: bool) -> None:
@@ -1044,6 +1408,10 @@ class BenchmarkTuiApp(App[None]):
             self.refresh_todo_async()
         elif button_id == "refresh_gpu_availability":
             self.refresh_full_free_gpus_async()
+        elif button_id == "clear_recent_finished":
+            self._recent_finished_hidden_job_ids.update(self._last_recent_finished_job_ids)
+            self._log("Cleared recently finished jobs list.")
+            self.refresh_jobs_async()
         elif button_id == "queue_local":
             self.queue_run_async(use_slurm=False)
         elif button_id == "queue_slurm":
